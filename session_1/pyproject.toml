@@ -19,6 +19,11 @@ onnx = [
     "onnx>=1.16",
     "onnxscript>=0.2",
 ]
+# Test/dev tooling. Install with:
+#   pip install -e ".[dev]"
+dev = [
+    "pytest>=8.0",
+]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -26,3 +31,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

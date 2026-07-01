@@ -195,6 +195,20 @@ docker compose down -v         # also remove the mlflow-data volume
 > Drop trained model files into `models/v1/` (e.g. `model.pkl`) to make them
 > available inside the container at `/models/v1/`.
 
+## Running tests
+
+Unit tests for the model live in [`tests/`](tests/) and use `pytest`. Install
+the `dev` extra, then run them:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+Expected output: `5 passed`. The tests mock the model's internal estimator
+(`RideDurationModel._model`) and exercise the prediction path plus threshold
+clipping.
+
 ## Exporting to ONNX
 
 [`pytorch_to_onnx.py`](pytorch_to_onnx.py) exports a small PyTorch model
@@ -225,6 +239,119 @@ Outputs: ['duration']
 
 > A couple of non-fatal warnings are expected (opset auto-bumped 17→18,
 > `torchvision not installed`) — they don't affect the exported model.
+
+## How `pyproject.toml` grew, stage by stage
+
+This project started with a flat `requirements.txt` and migrated to
+`pyproject.toml`, then grew as each new capability was added. Below is the exact
+edit made to the file at every stage — a small tour of how to shape a
+`pyproject.toml` around a project's needs.
+
+### Stage 0 — the starting point: `requirements.txt`
+
+Originally dependencies lived in a plain text file:
+
+```text
+fastapi
+uvicorn
+pydantic
+```
+
+No versions, no metadata, no way to declare optional/dev dependencies or build
+the project as an installable package.
+
+### Stage 1 — migrate to `pyproject.toml` (core dependencies)
+
+We replaced `requirements.txt` with a `pyproject.toml` that declares project
+metadata, a Python floor, pinned lower bounds, and a build backend. `litestar`
+was added here because [`litestar_example.py`](litestar_example.py) needs it:
+
+```toml
+[project]
+name = "ride-duration-api"
+version = "0.1.0"
+description = "A minimal FastAPI/Litestar service that predicts ride duration from trip distance and passenger count."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.138",
+    "uvicorn>=0.49",
+    "pydantic>=2.13",
+    "litestar>=2.24",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]      # makes `src` importable after `pip install`
+```
+
+Install everything (editable) with a single command:
+
+```bash
+pip install -e .
+```
+
+### Stage 2 — add an optional `onnx` extra (PyTorch → ONNX export)
+
+[`pytorch_to_onnx.py`](pytorch_to_onnx.py) needs `torch` and `onnx`, which are
+large and irrelevant to serving the API. Instead of bloating the core
+dependencies, we added an **optional-dependency group** so they install only on
+demand. (`onnxscript` was added after we found torch's exporter requires it.)
+
+```toml
+[project.optional-dependencies]
+# Heavy deps used only by pytorch_to_onnx.py (ONNX export). Install with:
+#   pip install -e ".[onnx]"
+onnx = [
+    "torch>=2.2",
+    "onnx>=1.16",
+    "onnxscript>=0.2",
+]
+```
+
+Install the core project **plus** the ONNX tooling:
+
+```bash
+pip install -e ".[onnx]"
+```
+
+### Stage 3 — add a `dev` extra + pytest config (tests)
+
+To run [`tests/`](tests/), we added a second optional group for test tooling and
+a `[tool.pytest.ini_options]` block so `pytest` knows where the tests live:
+
+```toml
+[project.optional-dependencies]
+# ... onnx group from Stage 2 ...
+# Test/dev tooling. Install with:
+#   pip install -e ".[dev]"
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+```
+
+Install the core project **plus** the dev tooling, then run the suite:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+### The result
+
+The final [`pyproject.toml`](pyproject.toml) cleanly separates concerns: a small
+core install for running the API, and opt-in extras for the heavy ONNX tooling
+and the test suite. Combine extras when you need several at once:
+
+```bash
+pip install -e ".[onnx,dev]"
+```
 
 ## Troubleshooting
 
