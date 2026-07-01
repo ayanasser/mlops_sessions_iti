@@ -137,6 +137,64 @@ Both frameworks auto-generate OpenAPI docs once the server is running.
 - **ReDoc:** http://127.0.0.1:8001/schema/redoc — clean reference view
 - **OpenAPI schema (JSON):** http://127.0.0.1:8001/schema/openapi.json
 
+## Docker
+
+The [`Dockerfile`](Dockerfile) builds the **FastAPI** app as a slim,
+production-style image using a **multi-stage build**: a `builder` stage installs
+the dependencies into an isolated virtualenv, and a minimal `runtime` stage
+copies only that venv plus the app code onto `python:3.12-slim`. The container
+runs as a non-root user and serves on port **8000** (bound to `0.0.0.0`).
+
+**Build the image:**
+
+```bash
+docker build -t ride-duration-api:session1 .
+```
+
+**Run the container:**
+
+```bash
+docker run --rm -p 8000:8000 ride-duration-api:session1
+```
+
+The API is then available at **http://127.0.0.1:8000** (same endpoints and docs
+as above). Stop it with `Ctrl+C`.
+
+## Docker Compose
+
+[`docker-compose.yml`](docker-compose.yml) runs the API alongside an
+[MLflow](https://mlflow.org/) tracking server, wiring together a small local
+MLOps stack:
+
+| Service  | Image / build      | Port   | Purpose                              |
+|----------|--------------------|--------|--------------------------------------|
+| `api`    | built from `Dockerfile` | `8000` | Ride Duration API                    |
+| `mlflow` | `ghcr.io/mlflow/mlflow` | `5000` | Experiment tracking + artifact store |
+
+The `api` service mounts a local [`models/`](models/) directory read-only at
+`/models` (via the `MODEL_PATH` env var) and waits for `mlflow` to start.
+MLflow persists its artifacts in the named `mlflow-data` volume.
+
+**Start the stack:**
+
+```bash
+docker compose up --build
+```
+
+- API: **http://127.0.0.1:8000**
+- MLflow UI: **http://127.0.0.1:5000**
+
+**Run in the background / tear down:**
+
+```bash
+docker compose up -d --build   # detached
+docker compose down            # stop and remove containers
+docker compose down -v         # also remove the mlflow-data volume
+```
+
+> Drop trained model files into `models/v1/` (e.g. `model.pkl`) to make them
+> available inside the container at `/models/v1/`.
+
 ## Exporting to ONNX
 
 [`pytorch_to_onnx.py`](pytorch_to_onnx.py) exports a small PyTorch model
