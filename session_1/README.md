@@ -10,17 +10,26 @@ MLOps course example.
 session_1/
 ├── fastapi_example.py    # FastAPI app + entry point
 ├── litestar_example.py   # Litestar app (same model, DI-based)
+├── msgpack_example.py    # MessagePack (de)serialization example
 ├── pytorch_to_onnx.py    # Export a PyTorch model to ONNX + validate
-├── pyproject.toml        # Project metadata + Python dependencies
+├── pyproject.toml        # Project metadata + dependencies (core + extras)
+├── Dockerfile            # Multi-stage image for the FastAPI app
+├── .dockerignore         # Files excluded from the Docker build context
+├── docker-compose.yml    # API + MLflow stack
+├── models/               # Local model mount (read-only in compose)
 ├── src/
 │   ├── __init__.py
-│   └── model.py          # RideDurationModel (placeholder heuristic)
+│   └── model.py          # RideDurationModel (delegates to a swappable estimator)
+├── tests/
+│   └── test_model.py     # pytest unit tests for the model
+├── docs/                 # Notes / supporting docs
 └── README.md
 ```
 
-> **Note:** `src/model.py` currently holds a simple placeholder model
-> (distance ÷ average speed + per-passenger overhead). Swap in a real trained
-> model when available — keep the `predict(features)` signature.
+> **Note:** `RideDurationModel` delegates prediction to an internal estimator
+> (`self._model`), which defaults to a simple heuristic (distance ÷ average
+> speed + per-passenger overhead). Swap in a real trained model by assigning any
+> object with a `predict(features) -> [value]` method.
 
 ## Requirements
 
@@ -239,6 +248,28 @@ Outputs: ['duration']
 
 > A couple of non-fatal warnings are expected (opset auto-bumped 17→18,
 > `torchvision not installed`) — they don't affect the exported model.
+
+## MessagePack serialization example
+
+[`msgpack_example.py`](msgpack_example.py) is a standalone demo (not part of the
+API) that compares JSON vs [MessagePack](https://msgpack.org/) — a compact
+binary serialization format — and shows caching feature vectors in Redis.
+
+It needs two packages that are **not** part of the project's dependencies:
+
+```bash
+pip install msgpack redis
+```
+
+```bash
+python msgpack_example.py
+```
+
+The first half prints the byte sizes of the same payload as JSON vs MessagePack
+(MessagePack is ~30% smaller). The second half is illustrative: it writes/reads
+a feature vector to Redis using MessagePack — running it requires a **local
+Redis server** (`redis-server`) on the default port, and the `model.predict(...)`
+call is a placeholder to show how cached features feed a prediction.
 
 ## How `pyproject.toml` grew, stage by stage
 
