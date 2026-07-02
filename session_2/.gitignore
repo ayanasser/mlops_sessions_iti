@@ -12,6 +12,10 @@ __pycache__/
 /mlruns/
 mlflow.db
 
+# W&B example artifacts (see w&b_example.py — runtime cruft, not source)
+/model.pkl
+/wandb/
+
 # Terraform (see infra/)
 infra/.terraform/
 infra/*.tfstate

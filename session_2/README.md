@@ -10,6 +10,10 @@ distance/passenger relationship from session 1.
 ```
 session_2/
 ├── mflow_example.py       # MLflow training + logging script (entry point)
+├── mlflowclient_example.py# load a registered model via MlflowClient (aliases)
+├── serve.py               # FastAPI inference service (/health, /predict)
+├── Dockerfile             # multi-stage image that serves the model
+├── .dockerignore          # trims the Docker build context
 ├── pyproject.toml         # Project metadata + Python dependencies
 ├── docker-compose.yml     # MLflow tracking server (from session 1)
 ├── config/
@@ -24,14 +28,19 @@ session_2/
 │   ├── evaluate.py        # DVC `evaluate` stage (model → metrics/scores.json)
 │   └── config.py          # YAML config loader
 ├── tests/
-│   └── test_train.py      # pytest suite for src/train.py
+│   ├── test_train.py      # pytest suite for src/train.py
+│   └── test_integration.py# end-to-end training/eval integration test
 ├── infra/                 # Terraform IaC (AWS: S3 DVC remote + ECR repo)
 │   ├── main.tf            # providers, S3 bucket, ECR repository, outputs
 │   ├── variables.tf       # input variables
 │   └── commands.md        # Terraform command cheatsheet
-├── .github/workflows/     # CI (lint + test)
 ├── .pre-commit-config.yaml
 └── README.md
+
+# The CI/CD workflow lives at the REPO ROOT (one level up), not in session_2/:
+mlops_sessions/
+└── .github/workflows/
+    └── ci_cd.yml          # lint + test, then build & push the Docker image
 ```
 
 > `src/train.py` deliberately contains **no MLflow calls** so it can be unit
@@ -190,6 +199,85 @@ pytest
 
 The suite exercises `src/train.py` only (data generation, split, training,
 evaluation) — it does **not** require a running MLflow server.
+
+## Serving the model (inference API)
+
+[`serve.py`](serve.py) is a small FastAPI app that loads the fitted model and
+exposes two endpoints:
+
+| Method & path  | Purpose                                                    |
+|----------------|------------------------------------------------------------|
+| `GET  /health` | Liveness probe (used by the Docker `HEALTHCHECK` and CI)   |
+| `POST /predict`| Predict duration from `{"distance_km": …, "passengers": …}`|
+
+The model file is chosen by the `MODEL_PATH` env var (default
+`models/rf_model.pkl`, produced by the DVC `train` stage). Run it locally:
+
+```bash
+pip install -e ".[serve]"                    # fastapi + uvicorn
+uvicorn serve:app --port 8000
+curl localhost:8000/health
+curl -X POST localhost:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"distance_km": 10, "passengers": 2}'   # -> {"duration_min": 21.08}
+```
+
+Or build and run the container (multi-stage image, runs as non-root, bakes in
+the model):
+
+```bash
+docker build -t ride-api .
+docker run -p 8000:8000 ride-api
+```
+
+## Continuous Integration / Delivery (GitHub Actions)
+
+The pipeline is defined in **`.github/workflows/ci_cd.yml`** at the **repository
+root** (`mlops_sessions/`), not inside `session_2/` — GitHub only discovers
+workflows at the repo root. Every `run:` step is scoped to `session_2/` via
+`defaults.run.working-directory`.
+
+| Job              | Trigger                     | What it does                                   |
+|------------------|-----------------------------|------------------------------------------------|
+| `lint-and-test`  | every push + PR to `main`   | Ruff lint/format check, pytest + 80% coverage  |
+| `build-and-push` | push to `main` only         | Build the Docker image and push to Docker Hub  |
+
+### Required secrets
+
+Add these as **repository secrets** on GitHub
+(repo → **Settings** → **Secrets and variables** → **Actions** →
+*New repository secret*). They are stored on GitHub, never committed to the repo.
+
+| Secret               | Needed for            | Where to get it                                                                 |
+|----------------------|-----------------------|---------------------------------------------------------------------------------|
+| `DOCKERHUB_USERNAME` | `build-and-push`      | Your Docker Hub username                                                         |
+| `DOCKERHUB_TOKEN`    | `build-and-push`      | hub.docker.com → Account Settings → **Personal access tokens** → *Read & Write* |
+| `CODECOV_TOKEN`      | `lint-and-test` (opt) | app.codecov.io → your repo → Settings → upload token                            |
+
+Notes:
+
+- Use a Docker Hub **access token**, not your password.
+- `CODECOV_TOKEN` is optional — the upload step has `fail_ci_if_error: false`, so
+  CI stays green without it. `lint-and-test` needs **no** secrets to run.
+
+Set them from the terminal with the GitHub CLI:
+
+```bash
+gh secret set DOCKERHUB_USERNAME --body "your-dockerhub-username"
+gh secret set DOCKERHUB_TOKEN      # prompts, paste the token (hidden)
+gh secret set CODECOV_TOKEN        # optional
+gh secret list                     # verify
+```
+
+### Run the workflow locally with `act` (optional)
+
+From the **repo root** (where `act` finds `.github/workflows/`):
+
+```bash
+cd ..                                    # into mlops_sessions/
+act -l                                   # list detected jobs
+act pull_request -j lint-and-test        # dry-run the test job in Docker
+```
 
 ## DVC pipeline
 

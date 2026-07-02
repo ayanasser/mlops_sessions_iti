@@ -28,6 +28,12 @@ dev = [
 dvc = [
     "dvc[s3]>=3.0",
 ]
+# Inference serving stack (see serve.py / Dockerfile). Install with:
+#   pip install -e ".[serve]"
+serve = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
 
 [build-system]
 requires = ["setuptools>=61"]
