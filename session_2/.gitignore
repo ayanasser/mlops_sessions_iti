@@ -11,6 +11,11 @@ __pycache__/
 /metrics/
 /mlruns/
 mlflow.db
+mlflow-s3.db
+
+# Secrets for the S3-backed MLflow server (see docker-compose.s3.yml).
+# The template .env.s3.example IS committed; the real .env is NOT.
+.env
 
 # W&B example artifacts (see w&b_example.py — runtime cruft, not source)
 /model.pkl

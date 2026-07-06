@@ -237,30 +237,33 @@ root** (`mlops_sessions/`), not inside `session_2/` — GitHub only discovers
 workflows at the repo root. Every `run:` step is scoped to `session_2/` via
 `defaults.run.working-directory`.
 
-| Job              | Trigger                     | What it does                                   |
-|------------------|-----------------------------|------------------------------------------------|
-| `lint-and-test`  | every push + PR to `main`   | Ruff lint/format check, pytest + 80% coverage  |
-| `build-and-push` | push to `main` only         | Build the Docker image and push to Docker Hub  |
+| Job              | Trigger                              | What it does                                   |
+|------------------|--------------------------------------|------------------------------------------------|
+| `lint-and-test`  | push to `main`/`develop`, PR to `main` | Ruff lint/format check, pytest + 80% coverage  |
+| `build-and-push` | push to `main` only                  | Build the Docker image and push to Docker Hub  |
 
-### Required secrets
+### 1. Required secrets
 
-Add these as **repository secrets** on GitHub
-(repo → **Settings** → **Secrets and variables** → **Actions** →
-*New repository secret*). They are stored on GitHub, never committed to the repo.
+Add these as **repository secrets** — repo → **Settings** → **Secrets and
+variables** → **Actions** → *New repository secret*. They live on GitHub and are
+never committed. (This is the **repo's** Settings tab, not your personal account
+settings.)
 
 | Secret               | Needed for            | Where to get it                                                                 |
 |----------------------|-----------------------|---------------------------------------------------------------------------------|
-| `DOCKERHUB_USERNAME` | `build-and-push`      | Your Docker Hub username                                                         |
-| `DOCKERHUB_TOKEN`    | `build-and-push`      | hub.docker.com → Account Settings → **Personal access tokens** → *Read & Write* |
+| `DOCKERHUB_USERNAME` | `build-and-push`      | Your Docker Hub username (also becomes the image namespace `<user>/ride-api`)   |
+| `DOCKERHUB_TOKEN`    | `build-and-push`      | hub.docker.com → Account settings → **Personal access tokens** → *Read & Write* |
 | `CODECOV_TOKEN`      | `lint-and-test` (opt) | app.codecov.io → your repo → Settings → upload token                            |
 
 Notes:
 
-- Use a Docker Hub **access token**, not your password.
+- `DOCKERHUB_TOKEN` is a Docker Hub **access token** (looks like `dckr_pat_…`),
+  **not** your password. Scope it *Read & Write* so CI can push.
 - `CODECOV_TOKEN` is optional — the upload step has `fail_ci_if_error: false`, so
   CI stays green without it. `lint-and-test` needs **no** secrets to run.
 
-Set them from the terminal with the GitHub CLI:
+Set them from the terminal with the GitHub CLI (must be authenticated as the
+repo owner — check with `gh auth status`):
 
 ```bash
 gh secret set DOCKERHUB_USERNAME --body "your-dockerhub-username"
@@ -269,14 +272,102 @@ gh secret set CODECOV_TOKEN        # optional
 gh secret list                     # verify
 ```
 
-### Run the workflow locally with `act` (optional)
+### 2. Build & verify the Docker image locally (before triggering CI)
+
+The `build-and-push` job just automates these steps — running them by hand first
+confirms the image builds, serves correctly, and that your Docker Hub token
+works, before you rely on CI.
+
+```bash
+cd session_2
+
+# 1. Build the image (Dockerfile + app + baked model all live in session_2/)
+docker build -t ride-api:local .
+
+# 2. Run it and smoke-test the same endpoints CI health-checks
+docker run -d --name ride-api -p 8000:8000 ride-api:local
+curl localhost:8000/health                        # {"status":"ok"}
+curl -X POST localhost:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"distance_km": 10, "passengers": 2}'        # {"duration_min": 21.08}
+docker rm -f ride-api
+
+# 3. (Optional) push by hand to confirm the token/permissions work
+docker login -u <your-dockerhub-username>          # paste the dckr_pat_… token as the password
+docker tag ride-api:local <your-dockerhub-username>/ride-api:test
+docker push <your-dockerhub-username>/ride-api:test
+```
+
+In CI the same build runs via `docker/build-push-action`, tagging every image
+two ways and reusing cached layers (`cache-from: …:latest`):
+
+| Tag                       | Example                      | Purpose                        |
+|---------------------------|------------------------------|--------------------------------|
+| `…/ride-api:<short-sha>`  | `ayanasser/ride-api:a1b2c3d` | Immutable, one per commit      |
+| `…/ride-api:latest`       | `ayanasser/ride-api:latest`  | Always the newest `main` build |
+
+### 3. Trigger the pipeline
+
+The workflow fires automatically on the events in its `on:` block — you trigger
+it with ordinary git pushes / PRs, there is no button to click:
+
+| Event                    | How you cause it                        | Jobs that run                      |
+|--------------------------|-----------------------------------------|------------------------------------|
+| **PR targeting `main`**  | open a PR from your branch              | `lint-and-test` only               |
+| **Push to `develop`**    | `git push origin develop`               | `lint-and-test` only               |
+| **Push to `main`**       | `git push origin main` / merge a PR     | `lint-and-test` → `build-and-push` |
+
+Typical flow — branch → PR (tests) → merge (tests + image build & push):
+
+```bash
+# 1. Work on a branch
+git checkout -b my-change
+git add -A && git commit -m "describe the change"
+git push -u origin my-change
+
+# 2. Open a PR to main  → runs lint-and-test
+gh pr create --base main --fill          # or use the link git prints on push
+
+# 3. Merge it           → push to main re-runs tests, then build-and-push
+gh pr merge --squash --delete-branch
+```
+
+> `build-and-push` is gated on `if: github.ref == 'refs/heads/main'`, so the
+> image is published **only after merge to `main`**, never from a PR — unreviewed
+> code never reaches your registry.
+
+There's no `workflow_dispatch` trigger, so the Actions tab has no *Run workflow*
+button. To enable manual runs, add `workflow_dispatch:` under `on:` in
+`ci_cd.yml`:
+
+```yaml
+on:
+  workflow_dispatch:        # adds a "Run workflow" button in the Actions tab
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+```
+
+### 4. Watch the results
+
+```bash
+gh run list                  # recent runs + pass/fail status
+gh run watch                 # live-tail the in-progress run
+gh run view --log-failed     # show logs for only the failed steps
+```
+
+Or open the repo's **Actions** tab in the browser. After a successful `main`
+build, the image appears on Docker Hub under `<your-username>/ride-api`.
+
+### 5. Dry-run the workflow locally with `act` (optional)
 
 From the **repo root** (where `act` finds `.github/workflows/`):
 
 ```bash
 cd ..                                    # into mlops_sessions/
 act -l                                   # list detected jobs
-act pull_request -j lint-and-test        # dry-run the test job in Docker
+act pull_request -j lint-and-test        # run the test job in Docker
 ```
 
 ## DVC pipeline
