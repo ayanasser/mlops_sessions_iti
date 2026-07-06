@@ -3,7 +3,7 @@ git checkout data-v1
 dvc checkout                 # or: dvc pull, if the cache lacks that version
 
 # return to latest
-git checkout ci/github-actions-and-serving
+git checkout main
 dvc checkout
 For the next version
 The repeatable recipe going forward:
