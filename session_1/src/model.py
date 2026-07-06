@@ -6,8 +6,7 @@ from typing import Optional, Protocol
 class Estimator(Protocol):
     """Anything with a scikit-learn-style ``predict`` method."""
 
-    def predict(self, features: list[float]) -> list[float]:
-        ...
+    def predict(self, features: list[float]) -> list[float]: ...
 
 
 class _HeuristicEstimator:

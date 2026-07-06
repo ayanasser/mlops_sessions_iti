@@ -57,7 +57,9 @@ print("  (server resolves that proxy URI to your s3://<bucket>/mlflow/… path)"
 # Identical to the local-volume example. The bytes are streamed S3 → server →
 # client over HTTP and deserialized into a RandomForestRegressor in memory here.
 model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
-print(f"\nLoaded '{MODEL_NAME}@champion' from S3-backed server -> {type(model).__name__}")
+print(
+    f"\nLoaded '{MODEL_NAME}@champion' from S3-backed server -> {type(model).__name__}"
+)
 
 # ── 4. Use it ─────────────────────────────────────────────────────────────────
 sample = np.array([[10.0, 2], [3.5, 1], [25.0, 4]])  # [distance_km, passengers]
@@ -74,7 +76,9 @@ if bucket and os.getenv("AWS_ACCESS_KEY_ID"):
     try:
         import boto3
 
-        s3 = boto3.client("s3", endpoint_url=os.getenv("MLFLOW_S3_ENDPOINT_URL") or None)
+        s3 = boto3.client(
+            "s3", endpoint_url=os.getenv("MLFLOW_S3_ENDPOINT_URL") or None
+        )
         resp = s3.list_objects_v2(Bucket=bucket, Prefix="mlflow/", MaxKeys=10)
         print(f"\nObjects physically in s3://{bucket}/mlflow/ (first 10):")
         for obj in resp.get("Contents", []):

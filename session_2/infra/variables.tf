@@ -4,6 +4,3 @@ variable "project_name" {
   type        = string
   default     = "ride-duration"
 }
-
-# infra/terraform.tfvars  (gitignored — holds real values)
-project_name = "ride-duration-prod"

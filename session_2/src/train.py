@@ -24,7 +24,11 @@ AVG_SPEED_KM_PER_MIN = 0.5
 PASSENGER_OVERHEAD_MIN = 0.5
 
 #: Default RandomForest hyperparameters logged to MLflow.
-DEFAULT_PARAMS: dict[str, Any] = {"n_estimators": 100, "max_depth": 6, "random_state": 42}
+DEFAULT_PARAMS: dict[str, Any] = {
+    "n_estimators": 100,
+    "max_depth": 6,
+    "random_state": 42,
+}
 
 #: Feature columns / target column used by the DVC pipeline (see prepare.py).
 FEATURES = ["distance_km", "passengers"]
@@ -51,8 +55,8 @@ def generate_data(
         shape ``(n_samples,)``.
     """
     rng = np.random.default_rng(seed)
-    distance = rng.uniform(0.5, 30.0, size=n_samples)          # km
-    passengers = rng.integers(1, 5, size=n_samples)            # 1..4
+    distance = rng.uniform(0.5, 30.0, size=n_samples)  # km
+    passengers = rng.integers(1, 5, size=n_samples)  # 1..4
 
     duration = (
         distance / AVG_SPEED_KM_PER_MIN
@@ -93,7 +97,9 @@ def train_model(
     return model
 
 
-def evaluate(model: RandomForestRegressor, X: np.ndarray, y: np.ndarray) -> dict[str, float]:
+def evaluate(
+    model: RandomForestRegressor, X: np.ndarray, y: np.ndarray
+) -> dict[str, float]:
     """Score ``model`` on ``(X, y)`` and return regression metrics.
 
     Returns:

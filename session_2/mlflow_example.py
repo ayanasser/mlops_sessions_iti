@@ -58,7 +58,6 @@ X_train, X_val, y_train, y_val = split_data(X, y, test_size=0.2, seed=42)
 
 
 with mlflow.start_run(run_name="rf-baseline") as run:
-
     # ── 1. Hyperparameters ──────────────────────────────────────────────────
     # log_params writes the run's configuration. These show up in the run's
     # "Parameters" table and become filterable/sortable columns in the
@@ -194,7 +193,7 @@ client.set_registered_model_alias(REGISTERED_MODEL_NAME, "champion", version)
 print(f"Run ID: {run_id}  |  MAE: {metrics['mae']:.3f}  |  R2: {metrics['r2']:.3f}")
 print(f"Registered '{REGISTERED_MODEL_NAME}' version {version} (alias: @champion)")
 print(f"Open the MLflow UI to inspect this run: {TRACKING_URI}")
-print(f"  • Learning-curve chart:  run → 'Model metrics' tab (lc_val_* series)")
-print(f"  • Diagnostic plots:      run → 'Artifacts' → plots/")
+print("  • Learning-curve chart:  run → 'Model metrics' tab (lc_val_* series)")
+print("  • Diagnostic plots:      run → 'Artifacts' → plots/")
 print(f"  • Registered model:      Models → {REGISTERED_MODEL_NAME}")
 print(f"Load the blessed model later with: models:/{REGISTERED_MODEL_NAME}@champion")

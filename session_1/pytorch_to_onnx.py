@@ -24,28 +24,29 @@ class RideDurationTorchModel(nn.Module):
 
 
 model = RideDurationTorchModel()
-model.eval()                      # disable dropout/batchnorm training mode
+model.eval()  # disable dropout/batchnorm training mode
 
 # Dummy input only defines the input SHAPE — values don't matter
-dummy_input = torch.randn(1, 2)   # [distance_km, passengers]
+dummy_input = torch.randn(1, 2)  # [distance_km, passengers]
 
 torch.onnx.export(
     model,
     dummy_input,
     "model.onnx",
-    export_params=True,           # bundle trained weights into the file
-    opset_version=17,             # ONNX operator set version
+    export_params=True,  # bundle trained weights into the file
+    opset_version=17,  # ONNX operator set version
     input_names=["features"],
     output_names=["duration"],
-    dynamic_axes={                 # allow variable batch size at inference
+    dynamic_axes={  # allow variable batch size at inference
         "features": {0: "batch_size"},
         "duration": {0: "batch_size"},
     },
 )
 
 # ── Always validate the export ─────────────────────
-import onnx
+import onnx  # noqa: E402  (imported at point of use for teaching clarity)
+
 onnx_model = onnx.load("model.onnx")
-onnx.checker.check_model(onnx_model)   # raises if graph is invalid
+onnx.checker.check_model(onnx_model)  # raises if graph is invalid
 print("Inputs: ", [i.name for i in onnx_model.graph.input])
 print("Outputs:", [o.name for o in onnx_model.graph.output])

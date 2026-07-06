@@ -24,4 +24,4 @@ resource "aws_ecr_repository" "api" {
 
 # ── Outputs ───────────────────────────────────────────
 output "s3_bucket_name" { value = aws_s3_bucket.dvc_remote.bucket }
-output "ecr_repo_url"   { value = aws_ecr_repository.api.repository_url }
+output "ecr_repo_url" { value = aws_ecr_repository.api.repository_url }
