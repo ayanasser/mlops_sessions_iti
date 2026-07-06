@@ -9,8 +9,8 @@ stages:
       size: 431
     - path: data/raw/rides.csv
       hash: md5
-      md5: 609d841f6b8bb03173fc73f9f0fcfd43
-      size: 77726
+      md5: 9dcd6dac450028e57d3b46c627957982
+      size: 77804
     - path: src/config.py
       hash: md5
       md5: 2c9ece5d1b1a19799ba37520bbe08d05
@@ -22,19 +22,19 @@ stages:
     outs:
     - path: data/processed/train.parquet
       hash: md5
-      md5: a771efe8c65dd56b4e56b936856107d1
-      size: 32905
+      md5: 8558985e4eeaae8fab292b617bddc83d
+      size: 32913
     - path: data/processed/val.parquet
       hash: md5
-      md5: 0f3fef098dbc578dc0438b949fe82a71
-      size: 9879
+      md5: 1fa02b607811834de557aa1b5666c985
+      size: 9915
   train:
     cmd: python src/train.py
     deps:
     - path: data/processed/train.parquet
       hash: md5
-      md5: a771efe8c65dd56b4e56b936856107d1
-      size: 32905
+      md5: 8558985e4eeaae8fab292b617bddc83d
+      size: 32913
     - path: src/config.py
       hash: md5
       md5: 2c9ece5d1b1a19799ba37520bbe08d05
@@ -50,19 +50,19 @@ stages:
     outs:
     - path: models/rf_model.pkl
       hash: md5
-      md5: f599c0420c683f313eee8f3f5c888b2c
-      size: 946945
+      md5: 2c7ada194ea73a8e3140d26eb2cc2a70
+      size: 946801
   evaluate:
     cmd: python src/evaluate.py
     deps:
     - path: data/processed/val.parquet
       hash: md5
-      md5: 0f3fef098dbc578dc0438b949fe82a71
-      size: 9879
+      md5: 1fa02b607811834de557aa1b5666c985
+      size: 9915
     - path: models/rf_model.pkl
       hash: md5
-      md5: f599c0420c683f313eee8f3f5c888b2c
-      size: 946945
+      md5: 2c7ada194ea73a8e3140d26eb2cc2a70
+      size: 946801
     - path: src/config.py
       hash: md5
       md5: 2c9ece5d1b1a19799ba37520bbe08d05
@@ -78,5 +78,5 @@ stages:
     outs:
     - path: metrics/scores.json
       hash: md5
-      md5: 4d27e6898d3c72f5fada03da871ec20f
-      size: 87
+      md5: 44c73fb47334b38d7575643d967c45f2
+      size: 89

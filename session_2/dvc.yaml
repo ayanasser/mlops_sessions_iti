@@ -1,10 +1,9 @@
 # dvc.yaml — defines the pipeline stages.
 #
-# This file lives in config/, but every stage runs from the project root via
-# `wdir: ..`, so all paths below are relative to session_2/. Run the pipeline
-# from the project root with:
+# This file lives at the project root, so all paths below are relative to
+# session_2/. Run the pipeline from the project root with:
 #
-#     dvc repro config/dvc.yaml
+#     dvc repro
 #
 # Stage graph:  prepare → train → evaluate
 
@@ -12,7 +11,6 @@ stages:
 
   # ── prepare: split the raw CSV into train/val parquet ──
   prepare:
-    wdir: ..
     cmd: python src/prepare.py
     deps:
       - src/prepare.py
@@ -25,7 +23,6 @@ stages:
 
   # ── train: fit a RandomForest on the train split ───────
   train:
-    wdir: ..
     cmd: python src/train.py
     deps:
       - src/train.py
@@ -40,7 +37,6 @@ stages:
 
   # ── evaluate: score the model on the val split ─────────
   evaluate:
-    wdir: ..
     cmd: python src/evaluate.py
     deps:
       - src/evaluate.py

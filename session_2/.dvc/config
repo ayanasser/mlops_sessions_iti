@@ -1,0 +1,8 @@
+[core]
+    remote = local
+['remote "local"']
+    url = /Users/ayanasser/dvc-remotes/mlops
+['remote "gcs"']
+    url = gs://my-gcs-bucket/dvc-store
+['remote "s3"']
+    url = s3://my-s3-bucket/dvc-store

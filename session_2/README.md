@@ -1,26 +1,40 @@
-# Ride Duration — MLflow Tracking (Session 2)
+# Ride Duration — Experiment Tracking (Session 2)
 
 Session 2 of the MLOps course. It trains a small **ride-duration** regression
 model on synthetic data and tracks the run — parameters, metrics, and the fitted
-model — with [MLflow](https://mlflow.org/). The model reuses the same
-distance/passenger relationship from session 1.
+model — with two experiment trackers so you can compare them side by side:
+[MLflow](https://mlflow.org/) and [Weights & Biases](https://wandb.ai/). The
+model reuses the same distance/passenger relationship from session 1.
+
+Around the training core it also wires up the surrounding MLOps toolchain: a DVC
+pipeline, a FastAPI serving image, a GitHub Actions CI/CD workflow, and Terraform
+for the AWS resources (S3 DVC remote + ECR).
 
 ## Project structure
 
 ```
 session_2/
-├── mflow_example.py       # MLflow training + logging script (entry point)
-├── mlflowclient_example.py# load a registered model via MlflowClient (aliases)
+├── mlflow_example.py                # MLflow training + logging script (entry point)
+├── mlflow_modelregiestry_example.py # load/promote a registered model via MlflowClient (aliases)
+├── mlflow_s3_registry_example.py    # same, against an S3-backed tracking server
+├── wandb_example.py                 # Weights & Biases counterpart to mlflow_example.py
 ├── serve.py               # FastAPI inference service (/health, /predict)
 ├── Dockerfile             # multi-stage image that serves the model
 ├── .dockerignore          # trims the Docker build context
 ├── pyproject.toml         # Project metadata + Python dependencies
-├── docker-compose.yml     # MLflow tracking server (from session 1)
+├── docker-compose.yml     # MLflow tracking server, local volume artifacts (from session 1)
+├── docker-compose.s3.yml  # MLflow tracking server, artifacts in an S3 bucket
+├── .env.s3.example        # template env for docker-compose.s3.yml (copy to .env)
+├── dvc.yaml               # DVC pipeline definition (prepare → train → evaluate)
+├── dvc.lock               # DVC lock file (recorded stage input/output hashes)
+├── .dvc/
+│   └── config             # DVC remotes: local (default) + gcs + s3
 ├── config/
-│   ├── config.yaml        # pipeline parameters (data + model)
-│   └── dvc.yaml           # DVC pipeline definition (prepare → train → evaluate)
+│   └── config.yaml        # pipeline parameters (data + model)
 ├── data/
-│   └── raw/rides.csv      # raw synthetic dataset (pipeline input)
+│   └── raw/
+│       ├── rides.csv      # raw synthetic dataset (pipeline input)
+│       └── rides.csv.dvc  # DVC pointer for the raw dataset
 ├── src/
 │   ├── __init__.py
 │   ├── train.py           # data gen, train, evaluate + DVC `train` stage
@@ -43,8 +57,10 @@ mlops_sessions/
     └── ci_cd.yml          # lint + test, then build & push the Docker image
 ```
 
-> `src/train.py` deliberately contains **no MLflow calls** so it can be unit
-> tested in isolation. All experiment tracking lives in `mflow_example.py`.
+> `src/train.py` deliberately contains **no tracking calls** so it can be unit
+> tested in isolation. It holds the shared model core (`generate_data`,
+> `split_data`, `train_model`, `evaluate`) reused by every tracking script; all
+> experiment tracking lives in `mlflow_example.py` / `wandb_example.py`.
 
 ## Requirements
 
@@ -162,25 +178,55 @@ docker compose up -d mlflow
 
 Tear down with `docker compose down` (add `-v` to also drop the volume).
 
+### Storing artifacts in S3 instead of a local volume
+
+[`docker-compose.s3.yml`](docker-compose.s3.yml) runs the same server but points
+`--artifacts-destination` at an S3 bucket instead of the local Docker volume.
+Thanks to `--serve-artifacts`, the server **proxies** S3 for you — client code and
+`load_model()` calls stay byte-for-byte identical and never need AWS credentials
+(only the server does).
+
+```bash
+cp .env.s3.example .env                       # fill in bucket + AWS keys
+docker compose -f docker-compose.s3.yml up -d # UI still at http://localhost:5000
+```
+
+The registry metadata (versions, `@champion`) still lives in a database — here
+SQLite bind-mounted to `mlflow-s3.db` on the host so it survives `down` (swap for
+Postgres in production; a commented service shows how). Register a version with
+`python mlflow_example.py` as usual, then load it back with
+[`mlflow_s3_registry_example.py`](mlflow_s3_registry_example.py) — whose code is
+unchanged from the local example, which is the whole point.
+
+> The real `.env` holds secrets and is git-ignored; only `.env.s3.example` is
+> committed. Set `MLFLOW_S3_ENDPOINT_URL` to target MinIO / R2 / LocalStack for a
+> fully local, no-AWS demo.
+
 ## 2. Run the training script
 
 ```bash
-python mflow_example.py
+python mlflow_example.py
 ```
 
 This will:
 
 1. Generate synthetic ride data and split it into train/validation sets
    (`src/train.py`).
-2. Log the hyperparameters (`n_estimators`, `max_depth`, …).
+2. Log the hyperparameters (`n_estimators`, `max_depth`, …) and free-form tags.
 3. Train a `RandomForestRegressor`.
 4. Log the metrics (`rmse`, `mae`, `r2`, `val_size`).
-5. Log **and register** the fitted model as `RideDurationModel`.
+5. Log a **learning curve** as stepped metrics (RMSE/MAE/R² vs. tree count) —
+   an interactive line chart in the UI.
+6. Log **diagnostic figures** as PNG artifacts (predicted-vs-actual, residuals,
+   feature importances).
+7. Log **and register** the fitted model as `RideDurationModel`, then annotate
+   the new version with a description, tags, and the moving alias `@champion`.
 
-It prints the run ID and MAE, e.g.:
+It prints the run ID, MAE, and the registered version, e.g.:
 
 ```
 Run ID: a1b2c3...  |  MAE: 0.83  |  R2: 0.99
+Registered 'RideDurationModel' version 1 (alias: @champion)
 ```
 
 Open **http://localhost:5000** to browse the experiment
@@ -189,6 +235,39 @@ Open **http://localhost:5000** to browse the experiment
 > The script reads the tracking URI from the `MLFLOW_TRACKING_URI` env var,
 > defaulting to `http://localhost:5000`. Point it at a remote server by
 > exporting that variable.
+
+### Consume the registered model
+
+Once a version exists, [`mlflow_modelregiestry_example.py`](mlflow_modelregiestry_example.py)
+is the consumer side: it lists the registered versions, promotes one by moving
+an alias (`@champion` → `@production`), loads it via
+`models:/RideDurationModel@production`, and runs a few predictions.
+
+```bash
+python mlflow_modelregiestry_example.py
+```
+
+## Tracking with Weights & Biases (alternative)
+
+[`wandb_example.py`](wandb_example.py) mirrors `mlflow_example.py` feature for
+feature against [W&B](https://wandb.ai/) — config/tags, scalar metrics, a stepped
+learning curve, diagnostic figures, a predictions `wandb.Table`, a versioned
+model **artifact** with a `champion` alias, and a Bayesian hyperparameter
+**sweep**. It's the easiest way to see how the two trackers map onto each other.
+
+```bash
+pip install -e ".[wandb]"          # wandb + matplotlib
+
+# Pick an auth mode first:
+wandb login                        # log to wandb.ai (free account + API key), or
+export WANDB_MODE=offline          # no account/network → runs written to ./wandb/
+
+python wandb_example.py
+```
+
+> In offline mode everything runs locally **except the sweep** (sweeps are
+> orchestrated by the W&B server and need a login); the script skips it
+> gracefully. Push saved offline runs later with `wandb sync wandb/offline-run-*`.
 
 ## Running tests
 
@@ -372,8 +451,8 @@ act pull_request -j lint-and-test        # run the test job in Docker
 
 ## DVC pipeline
 
-The reproducible training pipeline is defined in
-[`config/dvc.yaml`](config/dvc.yaml) as three stages:
+The reproducible training pipeline is defined in [`dvc.yaml`](dvc.yaml) (at the
+project root) as three stages:
 
 | Stage      | Command              | Inputs                                   | Outputs                         |
 |------------|----------------------|------------------------------------------|---------------------------------|
@@ -383,33 +462,72 @@ The reproducible training pipeline is defined in
 
 All hyperparameters live in [`config/config.yaml`](config/config.yaml); the
 `train` stage tracks `model.n_estimators` and `model.max_depth` as DVC params,
-so changing them invalidates the cache and triggers a re-run.
+so changing them invalidates the cache and triggers a re-run. Every stage's
+recorded input/output hashes live in [`dvc.lock`](dvc.lock) — commit it so the
+pipeline is reproducible for everyone.
 
-> `dvc.yaml` sits in `config/` but each stage uses `wdir: ..`, so every path is
-> relative to the project root.
-
-Install DVC and run the pipeline from the project root:
+Because `dvc.yaml` sits at the project root, all commands run without a path
+argument. Install DVC and run the pipeline from the project root:
 
 ```bash
-pip install -e ".[dvc]"           # DVC + S3 remote support
+pip install -e ".[dvc]"           # DVC + remote support
 
 dvc init --subdir                 # one-time, initialises DVC in session_2/
-dvc repro config/dvc.yaml         # run prepare → train → evaluate
+
+dvc repro                         # run prepare → train → evaluate
+dvc status                        # show which stages are stale (deps changed)
+dvc dag                           # visualise the stage graph
 dvc metrics show                  # print metrics/scores.json
-dvc dag config/dvc.yaml           # visualise the stage graph
 ```
 
 Re-running `dvc repro` only re-executes stages whose dependencies changed.
 
-### Remote storage (optional)
+### Tracking the raw data
 
-The `infra/` Terraform provisions an S3 bucket for DVC artifacts. Wire it up
-with:
+The raw dataset is tracked by DVC (pointer file `data/raw/rides.csv.dvc`), not
+by Git. When the CSV changes, re-add it and push the new version:
 
 ```bash
-dvc remote add -d storage s3://mlops-dvc-artifacts-<project_name>
-dvc push                          # upload tracked data/models to S3
+dvc add data/raw/rides.csv        # update the .dvc pointer + cache
+git add data/raw/rides.csv.dvc    # commit the pointer, not the CSV
 ```
+
+> A file cannot be tracked by both Git and DVC. If `dvc add` reports the file is
+> "already tracked by SCM", stop Git tracking it first:
+> `git rm -r --cached data/raw/rides.csv`.
+
+### Remote storage
+
+Remotes are defined in [`.dvc/config`](.dvc/config). Three are configured — a
+local directory (the default), a GCS bucket, and an S3 bucket:
+
+```bash
+dvc remote list                   # local (default), gcs, s3
+
+dvc push                          # push to the default (local) remote
+dvc push -r gcs                   # push to the GCS bucket
+dvc push -r s3                    # push to the S3 bucket
+dvc pull                          # pull tracked data/models from the default remote
+```
+
+Set or change a remote (and keep it the default with `-d`):
+
+```bash
+dvc remote add -d s3 s3://mlops-dvc-artifacts-<project_name>
+dvc remote modify s3 url s3://my-bucket/dvc-store   # change the URL
+```
+
+Credentials must **not** go in `.dvc/config` (it is committed to Git). Put them
+in the git-ignored `.dvc/config.local`:
+
+```bash
+dvc remote modify --local s3 access_key_id     YOUR_KEY
+dvc remote modify --local s3 secret_access_key YOUR_SECRET
+# GCS typically just uses: gcloud auth application-default login
+```
+
+The `infra/` Terraform provisions an S3 bucket
+(`mlops-dvc-artifacts-<project_name>`) you can point the `s3` remote at.
 
 ## Infrastructure (Terraform)
 
