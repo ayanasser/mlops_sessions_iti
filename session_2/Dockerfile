@@ -4,11 +4,15 @@
 #
 # Multi-stage build:
 #   • builder  — installs the project + serving deps into an isolated venv
-#   • runtime  — a slim image carrying only the venv, the app, and the model
+#   • runtime  — a slim image carrying only the venv and the app (no model)
 #
 # Build context is `session_2/` (see .github/workflows/ci_cd.yml → context).
+#
+# The image ships CODE ONLY — the model is NOT baked in, so one image serves any
+# model version. Provide a model at run time by mounting it at MODEL_PATH:
 # Build:  docker build -t ride-api .
-# Run:    docker run -p 8000:8000 ride-api
+# Run:    docker run -p 8000:8000 \
+#           -v "$(pwd)/models/rf_model.pkl:/app/models/rf_model.pkl:ro" ride-api
 #         → POST http://localhost:8000/predict  {"distance_km": 10, "passengers": 2}
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -48,11 +52,11 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 
-# The inference entry point and the trained model, baked into the image so the
-# container is self-contained (no runtime volume needed). Swap the model at
-# deploy time by mounting a file and overriding MODEL_PATH.
+# The inference entry point only — the model is NOT baked in. serve.py loads the
+# model from MODEL_PATH at startup, so provide one at run time by mounting a file
+# there (e.g. the latest @champion pulled from the MLflow/S3 model registry). One
+# image then serves any model version, and retraining never rebuilds it.
 COPY serve.py ./
-COPY models/rf_model.pkl ./models/rf_model.pkl
 
 # Run as a non-root user for safety.
 RUN useradd --create-home --uid 1000 appuser

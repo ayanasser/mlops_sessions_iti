@@ -19,7 +19,7 @@ session_2/
 ├── mlflow_s3_registry_example.py    # same, against an S3-backed tracking server
 ├── wandb_example.py                 # Weights & Biases counterpart to mlflow_example.py
 ├── serve.py               # FastAPI inference service (/health, /predict)
-├── Dockerfile             # multi-stage image that serves the model
+├── Dockerfile             # multi-stage, code-only image (model mounted at runtime)
 ├── .dockerignore          # trims the Docker build context
 ├── pyproject.toml         # Project metadata + Python dependencies
 ├── docker-compose.yml     # MLflow tracking server, local volume artifacts (from session 1)
@@ -301,13 +301,55 @@ curl -X POST localhost:8000/predict \
   -d '{"distance_km": 10, "passengers": 2}'   # -> {"duration_min": 21.08}
 ```
 
-Or build and run the container (multi-stage image, runs as non-root, bakes in
-the model):
+### The container ships **code only** — mount the model at run time
+
+The Docker image deliberately does **not** bake in a model. `serve.py` loads the
+model from `MODEL_PATH` at startup, so the image carries only the app + its
+dependencies and you supply the model as a **read-only bind mount** when you run
+it. This is the standard production pattern — the model artifact is decoupled
+from the code artifact:
+
+- **One image serves any model version.** Roll a new model out (or roll back) by
+  mounting a different file — no rebuild, no redeploy of the image.
+- **Retraining never rebuilds the image.** Training and serving evolve on
+  separate cadences.
+- **Smaller, immutable images** whose contents don't depend on which model is
+  current.
+
+Because there's no baked-in model, running the image **without** a mounted model
+fails fast at startup (`serve.py` can't load `MODEL_PATH`) — that's intended.
 
 ```bash
 docker build -t ride-api .
-docker run -p 8000:8000 ride-api
+
+# Mount the model file at MODEL_PATH (default /app/models/rf_model.pkl), read-only
+docker run -p 8000:8000 \
+  -v "$(pwd)/models/rf_model.pkl:/app/models/rf_model.pkl:ro" \
+  ride-api
 ```
+
+**Where does the mounted model come from?** Pull the latest blessed model from
+your **model registry** first, then mount whatever you fetched. For example,
+with the MLflow registry from this session (`@champion` alias):
+
+```bash
+# Fetch the current champion from the registry into ./models/rf_model.pkl
+python -c "import mlflow, joblib; \
+  m = mlflow.sklearn.load_model('models:/RideDurationModel@champion'); \
+  joblib.dump(m, 'models/rf_model.pkl')"
+
+# Point MODEL_PATH somewhere else if you prefer, and mount to match:
+docker run -p 8000:8000 \
+  -e MODEL_PATH=/models/champion.pkl \
+  -v "$(pwd)/models/rf_model.pkl:/models/champion.pkl:ro" \
+  ride-api
+```
+
+In a real deployment the same idea applies: an init container / entrypoint runs
+`dvc pull` or an `mlflow`/registry download to place the blessed model on a
+volume, and the serving container mounts it via `MODEL_PATH`. See
+[`mlflow_s3_registry_example.py`](mlflow_s3_registry_example.py) for the registry
+fetch side.
 
 ## Continuous Integration / Delivery (GitHub Actions)
 
@@ -318,8 +360,80 @@ workflows at the repo root. Every `run:` step is scoped to `session_2/` via
 
 | Job              | Trigger                              | What it does                                   |
 |------------------|--------------------------------------|------------------------------------------------|
-| `lint-and-test`  | push to `main`/`develop`, PR to `main` | Ruff lint/format check, pytest + 80% coverage  |
-| `build-and-push` | push to `main` only                  | Build the Docker image and push to Docker Hub  |
+| `lint-and-test`  | push to `main`/`develop`, PR to `main` | Ruff lint/format check, pytest + 50% coverage  |
+| `build-and-push` | push to `main` only                  | Build the **code-only** image and push to Docker Hub |
+
+### Code quality with Ruff
+
+[Ruff](https://docs.astral.sh/ruff/) is an extremely fast Python **linter and
+formatter** (written in Rust) that replaces the older Flake8 + Black + isort
+stack with a single tool. The `lint-and-test` job runs it in two separate steps,
+each doing a different job:
+
+```bash
+ruff check src/ tests/           # the LINTER
+ruff format --check src/ tests/  # the FORMATTER (verify-only)
+```
+
+**What is "linting"?** Linting is static analysis — a tool reads your source
+code *without running it* and flags likely bugs, suspicious constructs, and
+style-guide violations. The name comes from a 1978 Unix tool called `lint` that
+scanned C code for "fluff." It catches problems early, before they reach review
+or production.
+
+The two commands look similar but check completely different things:
+
+| | `ruff check` | `ruff format --check` |
+|---|--------------|-----------------------|
+| Role | **Linter** | **Formatter** (verify-only) |
+| Concerned with | *What the code does* | *How the code is arranged* |
+| Catches | Unused imports/variables, undefined names, mutable default args, unreachable code, PEP 8 rule violations, common bugs | Whitespace, indentation, quote style, line length, trailing commas not matching the canonical style |
+| In CI, fails when | Code has lint errors | Code isn't already formatted |
+| Fix it with | `ruff check --fix` | `ruff format` (drops `--check` → rewrites files) |
+
+Key point about `--check`: `ruff format` on its own **rewrites** your files to
+the canonical style, but `ruff format --check` **changes nothing** — it only
+verifies the files are already formatted and exits non-zero if not. That's why
+CI uses `--check`: it enforces formatting without modifying the checkout.
+
+Ruff ships with `pip install -e ".[dev]"`; run it standalone with
+`pip install ruff` or `brew install ruff`.
+
+**Most important Ruff commands** (they're also wired into
+[`.pre-commit-config.yaml`](.pre-commit-config.yaml) so they run on every
+commit — run them locally before pushing to keep CI green):
+
+```bash
+# ── Linting (code quality) ────────────────────────────────────────────
+ruff check src/ tests/           # report lint issues (what CI runs)
+ruff check .                     # lint the whole project
+ruff check --fix .               # auto-fix everything it safely can
+ruff check --fix --unsafe-fixes .# also apply fixes that may change behaviour
+ruff check --watch .             # re-lint continuously as you edit
+ruff check --select I --fix .    # fix only a rule group (I = import sorting)
+ruff check --statistics .        # count violations grouped by rule
+ruff check --add-noqa .          # insert `# noqa` comments on existing issues
+
+# ── Formatting (layout) ───────────────────────────────────────────────
+ruff format src/ tests/          # reformat files in place
+ruff format .                    # format the whole project
+ruff format --check .            # verify only, don't write (what CI runs)
+ruff format --diff .             # show the changes it *would* make
+
+# ── Housekeeping ──────────────────────────────────────────────────────
+ruff --version                   # print the installed version
+ruff rule F401                   # explain a specific rule (F401 = unused import)
+ruff clean                       # clear Ruff's cache
+```
+
+Typical local loop before a commit: **`ruff check --fix .`** then
+**`ruff format .`** — the first fixes lint issues, the second normalises layout.
+Suppress a single unavoidable warning inline with a `# noqa: <RULE>` comment
+(e.g. `import os  # noqa: F401`).
+
+> There's a small overlap — `ruff check` includes some formatting-related rules —
+> but the intended division is: `ruff format` owns all layout decisions, and
+> `ruff check` owns everything else (correctness and code quality).
 
 ### 1. Required secrets
 
@@ -360,11 +474,14 @@ works, before you rely on CI.
 ```bash
 cd session_2
 
-# 1. Build the image (Dockerfile + app + baked model all live in session_2/)
+# 1. Build the code-only image (Dockerfile + app live in session_2/; no model)
 docker build -t ride-api:local .
 
-# 2. Run it and smoke-test the same endpoints CI health-checks
-docker run -d --name ride-api -p 8000:8000 ride-api:local
+# 2. Run it WITH the model mounted, then smoke-test the endpoints CI health-checks.
+#    (You need a models/rf_model.pkl first — `dvc pull`, run the DVC train stage,
+#     or fetch @champion from the registry as shown above.)
+docker run -d --name ride-api -p 8000:8000 \
+  -v "$(pwd)/models/rf_model.pkl:/app/models/rf_model.pkl:ro" ride-api:local
 curl localhost:8000/health                        # {"status":"ok"}
 curl -X POST localhost:8000/predict \
   -H 'Content-Type: application/json' \
