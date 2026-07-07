@@ -5,6 +5,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Coverage artifacts (produced by pytest --cov; regenerated each run)
+.coverage
+coverage.xml
+htmlcov/
+
 # DVC pipeline outputs (tracked by DVC, not git)
 /data/processed/
 /models/
