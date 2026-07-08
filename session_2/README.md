@@ -202,6 +202,35 @@ unchanged from the local example, which is the whole point.
 > committed. Set `MLFLOW_S3_ENDPOINT_URL` to target MinIO / R2 / LocalStack for a
 > fully local, no-AWS demo.
 
+### Storing artifacts in GCS instead of a local volume
+
+[`docker-compose.gcs.yml`](docker-compose.gcs.yml) is the Google Cloud Storage twin
+of the S3 setup: it points `--artifacts-destination` at
+`gs://mlops-session2-iti/mlflow` instead of the local volume. The only real
+differences from S3 are the storage SDK (`google-cloud-storage`) and how the server
+authenticates — a **service-account key JSON** mounted into the container rather than
+env-var access keys. `--serve-artifacts` still proxies GCS, so client code and
+`load_model()` calls stay byte-for-byte identical and never need GCP credentials
+(only the server does).
+
+```bash
+# 1. Drop a service-account key (roles/storage.objectAdmin on the bucket) at:
+#      ./gcp-key.json          # gitignored — never committed
+# 2. Configure and start:
+cp .env.gcs.example .env                        # set bucket + key path
+docker compose -f docker-compose.gcs.yml up -d  # UI still at http://localhost:5000
+```
+
+The registry metadata (versions, `@champion`) still lives in a database — here
+SQLite kept in the bind-mounted `mlflow-gcs-data/` directory so it survives `down`
+(swap for Postgres in production; a commented service shows how). Register a version with
+`python mlflow_example.py` as usual, then load it back with
+[`mlflow_gcs_registry_example.py`](mlflow_gcs_registry_example.py) — whose code is
+unchanged from the local example, which is the whole point.
+
+> The service-account key and the real `.env` are git-ignored (`gcp-key.json`,
+> `.env`); only `.env.gcs.example` is committed.
+
 ## 2. Run the training script
 
 ```bash
@@ -351,6 +380,38 @@ volume, and the serving container mounts it via `MODEL_PATH`. See
 [`mlflow_s3_registry_example.py`](mlflow_s3_registry_example.py) for the registry
 fetch side.
 
+### Multi-stage build — why the `builder` stage matters
+
+The [`Dockerfile`](Dockerfile) uses a **two-stage build** that separates *how the
+image is built* from *what actually ships*:
+
+| Stage     | Role                                                                          |
+|-----------|-------------------------------------------------------------------------------|
+| `builder` | Installs the project + `serve` extra into an isolated venv at `/opt/venv`      |
+| `runtime` | Copies **only** that finished venv (`COPY --from=builder /opt/venv /opt/venv`) plus `serve.py` |
+
+The builder stage does all the messy work — running `pip install`, downloading
+wheels, compiling — inside a throwaway image. The runtime stage then copies over
+just the ready-to-use virtualenv and nothing else. Think of it as **kitchen vs.
+plate**: you cook in the kitchen (builder) and carry only the finished meal
+(`/opt/venv`) to the plate (runtime) the user actually gets.
+
+Why this is worth the extra stage:
+
+- **Smaller, cleaner final image.** pip caches, build tooling, `pyproject.toml`,
+  `README.md`, and the raw `src/` tree stay in the builder and are discarded —
+  only the installed venv lands in production.
+- **Smaller attack surface.** No pip cache or build cruft to exploit or leak.
+  Combined with the non-root `appuser`, the runtime image is a lean deployable.
+- **Better layer caching.** Dependencies install in their own layer that stays
+  cached until they actually change, so rebuilds are faster.
+- **Reproducible, decoupled builds.** The heavy install happens once in the
+  builder; the runtime is just a copy step.
+
+This is independent of the code-only design above: the builder/runtime split
+keeps the image *slim*, while mounting the model at run time keeps it
+*model-agnostic* — two separate wins.
+
 ## Continuous Integration / Delivery (GitHub Actions)
 
 The pipeline is defined in **`.github/workflows/ci_cd.yml`** at the **repository
@@ -446,12 +507,17 @@ settings.)
 |----------------------|-----------------------|---------------------------------------------------------------------------------|
 | `DOCKERHUB_USERNAME` | `build-and-push`      | Your Docker Hub username (also becomes the image namespace `<user>/ride-api`)   |
 | `DOCKERHUB_TOKEN`    | `build-and-push`      | hub.docker.com → Account settings → **Personal access tokens** → *Read & Write* |
+| `GCP_SA_KEY`         | `build-and-push`      | Full service-account **key JSON** (`roles/storage.objectAdmin` on the GCS bucket) — the same key used locally as `gcp-key.json` |
 | `CODECOV_TOKEN`      | `lint-and-test` (opt) | app.codecov.io → your repo → Settings → upload token                            |
 
 Notes:
 
 - `DOCKERHUB_TOKEN` is a Docker Hub **access token** (looks like `dckr_pat_…`),
   **not** your password. Scope it *Read & Write* so CI can push.
+- `GCP_SA_KEY` is the **entire contents** of the service-account JSON (not a path).
+  `build-and-push` writes it to `gcp-key.json` and runs `dvc pull -r gcs` to fetch
+  the model from `gs://mlops-session2-iti/dvc-store`, then smoke-tests the image
+  against it before pushing. Without it, that job fails at the model-pull step.
 - `CODECOV_TOKEN` is optional — the upload step has `fail_ci_if_error: false`, so
   CI stays green without it. `lint-and-test` needs **no** secrets to run.
 
@@ -461,6 +527,7 @@ repo owner — check with `gh auth status`):
 ```bash
 gh secret set DOCKERHUB_USERNAME --body "your-dockerhub-username"
 gh secret set DOCKERHUB_TOKEN      # prompts, paste the token (hidden)
+gh secret set GCP_SA_KEY < gcp-key.json   # feed the whole key JSON from the file
 gh secret set CODECOV_TOKEN        # optional
 gh secret list                     # verify
 ```
@@ -616,35 +683,162 @@ git add data/raw/rides.csv.dvc    # commit the pointer, not the CSV
 ### Remote storage
 
 Remotes are defined in [`.dvc/config`](.dvc/config). Three are configured — a
-local directory (the default), a GCS bucket, and an S3 bucket:
+local directory (the default), a GCS bucket (`gs://mlops-session2-iti/dvc-store`),
+and an S3 bucket:
 
 ```bash
 dvc remote list                   # local (default), gcs, s3
 
 dvc push                          # push to the default (local) remote
-dvc push -r gcs                   # push to the GCS bucket
+dvc push -r gcs                   # push tracked data to the GCS bucket
 dvc push -r s3                    # push to the S3 bucket
-dvc pull                          # pull tracked data/models from the default remote
+dvc pull -r gcs                   # pull tracked data/models back from GCS
+```
+
+**Pushing tracked data to GCS.** Install the GCS extra, point DVC at a
+service-account key, and push:
+
+```bash
+pip install -e ".[gcs]"           # pulls in dvc[gs]
+
+# The gcs remote in .dvc/config already points credentialpath at ./gcp-key.json.
+# Drop a key with roles/storage.objectAdmin on the bucket there (gitignored),
+# then:
+dvc push -r gcs                   # uploads data/raw/rides.csv → gs://…/dvc-store/
 ```
 
 Set or change a remote (and keep it the default with `-d`):
 
 ```bash
-dvc remote add -d s3 s3://mlops-dvc-artifacts-<project_name>
-dvc remote modify s3 url s3://my-bucket/dvc-store   # change the URL
+dvc remote add -d gcs gs://mlops-session2-iti/dvc-store
+dvc remote modify gcs url gs://my-bucket/dvc-store   # change the URL
 ```
 
-Credentials must **not** go in `.dvc/config` (it is committed to Git). Put them
-in the git-ignored `.dvc/config.local`:
+A key *path* (`credentialpath`) is not itself a secret, so it can live in the
+committed `.dvc/config`. The **key file** must never be committed — `gcp-key.json`
+is git-ignored. As alternatives to a key file you can authenticate with
+`gcloud auth application-default login` (drop `credentialpath` and DVC uses your
+ADC), and S3 keys go in the git-ignored `.dvc/config.local`:
 
 ```bash
 dvc remote modify --local s3 access_key_id     YOUR_KEY
 dvc remote modify --local s3 secret_access_key YOUR_SECRET
-# GCS typically just uses: gcloud auth application-default login
 ```
 
 The `infra/` Terraform provisions an S3 bucket
-(`mlops-dvc-artifacts-<project_name>`) you can point the `s3` remote at.
+(`mlops-dvc-artifacts-<project_name>`) you can point the `s3` remote at; the GCS
+bucket (`mlops-session2-iti`) is managed outside Terraform here.
+
+## Pushing models & data to GCS (end-to-end)
+
+This is the complete walkthrough for sending **tracked data** (via DVC) and
+**registered-model artifacts** (via MLflow) to the Google Cloud Storage bucket
+`gs://mlops-session2-iti`, which has two prefixes:
+
+```
+gs://mlops-session2-iti/
+├── dvc-store/   ← DVC data lands here   (dvc push -r gcs)
+└── mlflow/      ← MLflow artifacts here (the tracking server writes these)
+```
+
+The client/training code never changes and never needs GCP credentials — only the
+DVC CLI and the MLflow **server** authenticate to the bucket. Both read the same
+service-account key.
+
+### Step 1 — Get a service-account key
+
+The key is a JSON file with **`roles/storage.objectAdmin`** on the bucket. Create
+it either way, then save it as **`./gcp-key.json`** in `session_2/` (already
+git-ignored — never commit it).
+
+**Option A — Cloud Console (no CLI to install):**
+
+1. **IAM & Admin → Service Accounts** → create or pick a service account.
+2. Grant it **Storage Object Admin** on bucket `mlops-session2-iti`
+   (IAM & Admin → grant role `roles/storage.objectAdmin`).
+3. On the service account → **Keys → Add key → Create new key → JSON** → download.
+4. Move the downloaded file to `session_2/gcp-key.json`.
+
+**Option B — gcloud CLI** (install with `brew install --cask google-cloud-sdk`;
+it is a system tool, **not** a `pip`/venv package):
+
+```bash
+gcloud init                                   # login + select project
+gcloud iam service-accounts keys create ./gcp-key.json \
+  --iam-account=YOUR_SA@YOUR_PROJECT.iam.gserviceaccount.com
+```
+
+### Step 2 — Install the GCS extras
+
+```bash
+pip install -e ".[gcs]"     # adds dvc[gs] for the DVC remote
+```
+
+(The MLflow server installs `google-cloud-storage` itself on startup — see
+`docker-compose.gcs.yml` — so nothing extra is needed in the venv for it.)
+
+### Step 3 — Push tracked DATA with DVC
+
+The `gcs` remote in [`.dvc/config`](.dvc/config) already points at
+`gs://mlops-session2-iti/dvc-store` with `credentialpath = ./gcp-key.json`:
+
+```bash
+# Make sure the data is tracked (already committed for this repo):
+dvc add data/raw/rides.csv        # only if not already tracked
+
+dvc push -r gcs                   # uploads data → gs://…/dvc-store/
+dvc pull -r gcs                   # (later, on another machine) pulls it back
+```
+
+To make `gcs` the default remote so a bare `dvc push` targets it:
+
+```bash
+dvc remote default gcs
+```
+
+### Step 4 — Push MODEL ARTIFACTS with MLflow
+
+Start the GCS-backed tracking server, then register a model as usual — its
+artifacts land in `gs://…/mlflow/`:
+
+```bash
+cp .env.gcs.example .env                        # bucket + key path (defaults fit)
+docker compose -f docker-compose.gcs.yml up -d  # UI at http://localhost:5000
+
+python mlflow_example.py                         # trains + registers a version
+```
+
+The server writes `model.skops`, plots, etc. to `gs://mlops-session2-iti/mlflow/…`.
+The registry metadata (versions, `@champion`) stays in SQLite (in the
+bind-mounted `mlflow-gcs-data/` directory so it survives `docker compose down`) — object storage holds files,
+not rows.
+
+### Step 5 — Verify it landed in the bucket
+
+```bash
+python mlflow_gcs_registry_example.py     # loads models:/…@champion back
+```
+
+Set the two env vars first and the script also lists the raw objects under
+`gs://…/mlflow/` to prove they're physically there:
+
+```bash
+export MLFLOW_GCS_BUCKET=mlops-session2-iti
+export GOOGLE_APPLICATION_CREDENTIALS=./gcp-key.json
+python mlflow_gcs_registry_example.py
+```
+
+Or inspect directly (Console → the bucket, or `gcloud storage ls` if you installed
+the CLI):
+
+```bash
+gcloud storage ls -r gs://mlops-session2-iti/dvc-store/
+gcloud storage ls -r gs://mlops-session2-iti/mlflow/
+```
+
+> **Never commit** `gcp-key.json` or the real `.env` — both are git-ignored.
+> Only `.env.gcs.example` and the `credentialpath` *pointer* in `.dvc/config` are
+> committed (a path is not a secret; the key file it points to is).
 
 ## Infrastructure (Terraform)
 

@@ -34,6 +34,11 @@ dev = [
 dvc = [
     "dvc[s3]>=3.0",
 ]
+# DVC pipeline runner + GCS remote (gs://mlops-session2-iti/dvc-store). Install with:
+#   pip install -e ".[gcs]"
+gcs = [
+    "dvc[gs]>=3.0",
+]
 # Inference serving stack (see serve.py / Dockerfile). Install with:
 #   pip install -e ".[serve]"
 serve = [
