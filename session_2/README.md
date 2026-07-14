@@ -7,24 +7,39 @@ model — with two experiment trackers so you can compare them side by side:
 model reuses the same distance/passenger relationship from session 1.
 
 Around the training core it also wires up the surrounding MLOps toolchain: a DVC
-pipeline, a FastAPI serving image, a GitHub Actions CI/CD workflow, and Terraform
-for the AWS resources (S3 DVC remote + ECR).
+pipeline, a FastAPI serving image, Ruff + pre-commit code quality, a GitHub
+Actions CI/CD workflow, and Terraform for the cloud storage bucket.
+
+**This README is organised in the order you'd actually work through the stack:**
+
+1. [MLflow](#1-mlflow--experiment-tracking--model-registry) — track & register the model
+2. [Weights & Biases](#2-weights--biases-alternative-tracker) — the alternative tracker
+3. [DVC](#3-dvc--data-versioning--pipeline) — version the data & artifacts
+4. [Code quality](#4-code-quality-ruff-black--pre-commit) — Ruff, Black, pre-commit
+5. [Terraform](#5-infrastructure-with-terraform) — provision the cloud bucket
+6. [CI/CD](#6-cicd-github-actions) — GitHub Actions
+
+(The [serving image](#serving-the-model-inference-api) sits just before CI/CD,
+since that's what CI builds and pushes.)
 
 ## Project structure
 
 ```
 session_2/
-├── mlflow_example.py                # MLflow training + logging script (entry point)
-├── mlflow_modelregiestry_example.py # load/promote a registered model via MlflowClient (aliases)
-├── mlflow_s3_registry_example.py    # same, against an S3-backed tracking server
-├── wandb_example.py                 # Weights & Biases counterpart to mlflow_example.py
+├── mlflow_example.py                 # MLflow training + logging script (entry point)
+├── mlflow_modelregiestry_example.py  # load/promote a registered model via MlflowClient (aliases)
+├── mlflow_s3_registry_example.py     # same, against an S3-backed tracking server
+├── mlflow_gcs_registry_example.py    # same, against a GCS-backed tracking server
+├── wandb_example.py                  # Weights & Biases counterpart to mlflow_example.py
 ├── serve.py               # FastAPI inference service (/health, /predict)
 ├── Dockerfile             # multi-stage, code-only image (model mounted at runtime)
 ├── .dockerignore          # trims the Docker build context
 ├── pyproject.toml         # Project metadata + Python dependencies
 ├── docker-compose.yml     # MLflow tracking server, local volume artifacts (from session 1)
 ├── docker-compose.s3.yml  # MLflow tracking server, artifacts in an S3 bucket
+├── docker-compose.gcs.yml # MLflow tracking server, artifacts in a GCS bucket
 ├── .env.s3.example        # template env for docker-compose.s3.yml (copy to .env)
+├── .env.gcs.example       # template env for docker-compose.gcs.yml (copy to .env)
 ├── dvc.yaml               # DVC pipeline definition (prepare → train → evaluate)
 ├── dvc.lock               # DVC lock file (recorded stage input/output hashes)
 ├── .dvc/
@@ -44,17 +59,18 @@ session_2/
 ├── tests/
 │   ├── test_train.py      # pytest suite for src/train.py
 │   └── test_integration.py# end-to-end training/eval integration test
-├── infra/                 # Terraform IaC (AWS: S3 DVC remote + ECR repo)
-│   ├── main.tf            # providers, S3 bucket, ECR repository, outputs
-│   ├── variables.tf       # input variables
+├── infra/                 # Terraform IaC (GCP GCS bucket; AWS S3/ECR kept commented)
+│   ├── main.tf            # providers, GCS bucket, outputs
+│   ├── variables.tf       # input variables (project_name, gcp_project, gcp_region)
 │   └── commands.md        # Terraform command cheatsheet
 ├── .pre-commit-config.yaml
 └── README.md
 
 # The CI/CD workflow lives at the REPO ROOT (one level up), not in session_2/:
 mlops_sessions/
-└── .github/workflows/
-    └── ci_cd.yml          # lint + test, then build & push the Docker image
+├── .github/workflows/
+│   └── ci_cd.yml          # lint + test, then build & push the Docker image
+└── .pre-commit-config.yaml
 ```
 
 > `src/train.py` deliberately contains **no tracking calls** so it can be unit
@@ -66,7 +82,8 @@ mlops_sessions/
 
 - Python 3.10+
 - Docker (for the MLflow tracking server)
-- Terraform 1.x + AWS CLI (for the `infra/` provisioning)
+- Terraform 1.x + the `gcloud` CLI (for the `infra/` GCS bucket)
+- AWS CLI — optional, only if you point DVC at an S3 remote
 - GitHub CLI (`gh`) — optional, for CI/PR workflows
 
 ## Installing the toolchain
@@ -100,7 +117,17 @@ choco install terraform        # or: winget install HashiCorp.Terraform
 terraform version              # verify
 ```
 
-### AWS CLI
+### Google Cloud SDK (`gcloud`)
+
+```bash
+brew install --cask google-cloud-sdk    # macOS
+# Linux:   curl https://sdk.cloud.google.com | bash && exec -l $SHELL
+# Windows: winget install Google.CloudSDK
+
+gcloud version                          # verify
+```
+
+### AWS CLI (optional — only for an S3 DVC remote)
 
 ```bash
 # macOS
@@ -160,10 +187,14 @@ act --version
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install --upgrade pip
-pip install -e ".[dev]"            # core deps + pytest
+pip install -e ".[dev]"            # core deps + pytest + ruff + pre-commit
 ```
 
-## 1. Start the MLflow tracking server
+---
+
+## 1. MLflow — experiment tracking & model registry
+
+### Start the tracking server
 
 The MLflow service is carried over from session 1's `docker-compose.yml`:
 
@@ -178,7 +209,7 @@ docker compose up -d mlflow
 
 Tear down with `docker compose down` (add `-v` to also drop the volume).
 
-### Storing artifacts in S3 instead of a local volume
+#### Storing artifacts in S3 instead of a local volume
 
 [`docker-compose.s3.yml`](docker-compose.s3.yml) runs the same server but points
 `--artifacts-destination` at an S3 bucket instead of the local Docker volume.
@@ -200,9 +231,11 @@ unchanged from the local example, which is the whole point.
 
 > The real `.env` holds secrets and is git-ignored; only `.env.s3.example` is
 > committed. Set `MLFLOW_S3_ENDPOINT_URL` to target MinIO / R2 / LocalStack for a
-> fully local, no-AWS demo.
+> fully local, no-AWS demo. Leave it **empty** for real AWS — the SDK derives the
+> endpoint from the region, and the `or None` guard in the example turns the empty
+> string into "use the default AWS endpoint."
 
-### Storing artifacts in GCS instead of a local volume
+#### Storing artifacts in GCS instead of a local volume
 
 [`docker-compose.gcs.yml`](docker-compose.gcs.yml) is the Google Cloud Storage twin
 of the S3 setup: it points `--artifacts-destination` at
@@ -231,7 +264,7 @@ unchanged from the local example, which is the whole point.
 > The service-account key and the real `.env` are git-ignored (`gcp-key.json`,
 > `.env`); only `.env.gcs.example` is committed.
 
-## 2. Run the training script
+### Run the training script
 
 ```bash
 python mlflow_example.py
@@ -276,13 +309,50 @@ an alias (`@champion` → `@production`), loads it via
 python mlflow_modelregiestry_example.py
 ```
 
-## Tracking with Weights & Biases (alternative)
+**How a teammate loads your model.** The registry lives in the *server's*
+database, so anyone who can reach the same tracking server can load a model by
+alias or version — with **no cloud credentials** (the server proxies the
+artifacts):
 
-[`wandb_example.py`](wandb_example.py) mirrors `mlflow_example.py` feature for
-feature against [W&B](https://wandb.ai/) — config/tags, scalar metrics, a stepped
-learning curve, diagnostic figures, a predictions `wandb.Table`, a versioned
-model **artifact** with a `champion` alias, and a Bayesian hyperparameter
-**sweep**. It's the easiest way to see how the two trackers map onto each other.
+```bash
+export MLFLOW_TRACKING_URI=https://mlflow.your-company.internal   # the shared server
+```
+
+```python
+import mlflow
+
+# by alias (recommended — "which version is prod" is decoupled from code):
+model = mlflow.sklearn.load_model("models:/RideDurationModel@champion")
+
+# or by explicit version:
+model = mlflow.sklearn.load_model("models:/RideDurationModel/3")
+```
+
+> A model registered against `http://localhost:5000` is only reachable on *your*
+> machine. To share it, register against a shared server (GCP), or expose your
+> local server on `0.0.0.0` / a tunnel. See
+> [`mlflow_gcs_registry_example.py`](mlflow_gcs_registry_example.py) for the
+> GCS-backed consumer.
+
+---
+
+## 2. Weights & Biases (alternative tracker)
+
+[`wandb_example.py`](wandb_example.py) mirrors `mlflow_example.py` **feature for
+feature** against [W&B](https://wandb.ai/), so you can see how the two trackers
+map onto each other:
+
+| MLflow                              | Weights & Biases                                |
+|-------------------------------------|-------------------------------------------------|
+| `mlflow.log_params(...)`            | `wandb.init(config=...)`                         |
+| `mlflow.set_tags(...)`              | `wandb.init(tags=..., notes=...)`                |
+| `mlflow.log_metrics(...)`           | `wandb.log({...})`                               |
+| `log_metric(name, v, step=...)`     | `wandb.log({...}, step=...)` (line charts)       |
+| `mlflow.log_figure(fig, name)`      | `wandb.log({name: wandb.Image(fig)})`            |
+| `log_model` + `registered_model`    | `wandb.Artifact(...)` + aliases (`"champion"`)   |
+| `client.set_..._alias` / tags       | artifact aliases + `metadata`                    |
+
+### Install & authenticate
 
 ```bash
 pip install -e ".[wandb]"          # wandb + matplotlib
@@ -294,19 +364,541 @@ export WANDB_MODE=offline          # no account/network → runs written to ./wa
 python wandb_example.py
 ```
 
+### What the script logs (and how)
+
+Everything happens inside a run opened with `wandb.init(...)` and closed with
+`run.finish()`. The pieces:
+
+- **Config & metadata** — hyperparameters go into `config`, free-form labels into
+  `tags`/`notes`; all are searchable in the UI:
+  ```python
+  run = wandb.init(
+      project="ride-duration", name="rf-baseline",
+      config={"n_estimators": 100, "max_depth": 6},
+      tags=["random_forest", "synthetic-v1"], notes="baseline on synthetic-v1",
+  )
+  ```
+- **Scalar metrics** — one `wandb.log({...})` call records the run's headline
+  numbers:
+  ```python
+  wandb.log({"rmse": rmse, "mae": mae, "r2": r2, "val_size": len(y_val)})
+  ```
+- **Learning curve (stepped metrics)** — logging the *same* key repeatedly with an
+  increasing `step` makes W&B plot it as an interactive line chart. Prefixing the
+  keys (`lc/…`) groups them into their own panel:
+  ```python
+  for n in (10, 25, 50, 100, 200, 400):
+      m = evaluate(train_model(X_train, y_train, {**params, "n_estimators": n}), X_val, y_val)
+      wandb.log({"lc/val_rmse": m["rmse"], "lc/val_mae": m["mae"]}, step=n)
+  ```
+- **Diagnostic figures** — hand a matplotlib `Figure` to `wandb.Image(...)` and it
+  renders inline in the run's Media panel (predicted-vs-actual, residual
+  histogram, feature importances):
+  ```python
+  wandb.log({"plots/residuals": wandb.Image(fig_res)})
+  ```
+- **A W&B Table** — sortable/filterable raw rows behind the plots, queryable across
+  runs:
+  ```python
+  table = wandb.Table(columns=["distance_km", "passengers", "actual", "predicted"])
+  table.add_data(10.0, 2, 21.3, 21.1)
+  wandb.log({"val_predictions": table})
+  ```
+- **Model as a versioned artifact ("register")** — W&B has no separate registry
+  API; you log the model as an `Artifact` and attach a moving `champion` alias.
+  Downstream code fetches `run.use_artifact("ride-duration-model:champion")` and
+  always gets the blessed version without hard-coding a number:
+  ```python
+  art = wandb.Artifact("ride-duration-model", type="model",
+                       metadata={**params, **metrics, "validated": True})
+  art.add_file("model.pkl")
+  run.log_artifact(art, aliases=["champion", "synthetic-v1"])
+  ```
+- **Hyperparameter sweep (Bayesian)** — declare a search space and let a W&B agent
+  drive trials, minimising `mae`:
+  ```python
+  sweep_id = wandb.sweep({"method": "bayes",
+                          "metric": {"name": "mae", "goal": "minimize"},
+                          "parameters": {"n_estimators": {"values": [50, 100, 200]},
+                                         "max_depth": {"min": 3, "max": 10}}},
+                         project="ride-duration")
+  wandb.agent(sweep_id, function=train_fn, count=20)   # 20 trials
+  ```
+
 > In offline mode everything runs locally **except the sweep** (sweeps are
 > orchestrated by the W&B server and need a login); the script skips it
 > gracefully. Push saved offline runs later with `wandb sync wandb/offline-run-*`.
 
-## Running tests
+---
+
+## 3. DVC — data versioning & pipeline
+
+MLflow/W&B version **experiments and models**; [DVC](https://dvc.org/) versions the
+**data (and any large artifact) that feeds them**. It keeps a tiny text pointer
+(`*.dvc`) in git while the real bytes live in a remote (S3, GCS, a local disk…),
+so `git checkout <tag> && dvc checkout` reproduces the *exact* data a commit was
+built on.
+
+> **This repo already has DVC initialised** with a GCS remote (see
+> [`.dvc/config`](.dvc/config): `gs://mlops-session2-iti/dvc-store`). The
+> `git init && dvc init` step below is only for bootstrapping a *fresh* repo.
+> The `s3://…` URLs are the generic pattern — swap in your own S3 or GCS bucket.
+
+### The reproducible pipeline (`dvc repro`)
+
+The training pipeline is defined in [`dvc.yaml`](dvc.yaml) (at the project root)
+as three stages:
+
+| Stage      | Command                  | Inputs                                     | Outputs                              |
+|------------|--------------------------|--------------------------------------------|--------------------------------------|
+| `prepare`  | `python src/prepare.py`  | `data/raw/rides.csv`, `config/config.yaml` | `data/processed/{train,val}.parquet` |
+| `train`    | `python src/train.py`    | `train.parquet`, `model.*` params          | `models/rf_model.pkl`                |
+| `evaluate` | `python src/evaluate.py` | `rf_model.pkl`, `val.parquet`              | `metrics/scores.json`                |
+
+All hyperparameters live in [`config/config.yaml`](config/config.yaml); the
+`train` stage tracks `model.n_estimators` and `model.max_depth` as DVC params,
+so changing them invalidates the cache and triggers a re-run. Every stage's
+recorded input/output hashes live in [`dvc.lock`](dvc.lock) — commit it so the
+pipeline is reproducible for everyone.
+
+```bash
+pip install -e ".[dvc]"           # DVC + remote support
+
+dvc repro                         # run prepare → train → evaluate (only stale stages)
+dvc status                        # show which stages are stale (deps changed)
+dvc dag                           # visualise the stage graph
+dvc metrics show                  # print metrics/scores.json
+```
+
+### Step 1 — Initialise DVC in a repo
+
+```bash
+# ── Step 1: Initialize DVC in your repo ──────────────
+git init && dvc init
+git add .dvc/ && git commit -m "init: add dvc"
+```
+
+`dvc init` creates the `.dvc/` directory (config + cache metadata). Commit it so
+collaborators inherit the same DVC setup.
+
+### Step 2 — Track a large data file
+
+```bash
+# ── Step 2: Track a large data file ───────────────────
+dvc add data/raw/rides.csv
+# Creates: data/raw/rides.csv.dvc  (tiny pointer file holding the content hash)
+# Adds:    data/raw/rides.csv to .gitignore automatically (git never sees the bytes)
+git add data/raw/rides.csv.dvc data/raw/.gitignore
+git commit -m "data: track rides.csv with DVC"
+```
+
+Git now tracks only the small `.dvc` pointer; the actual CSV is stored in DVC's
+local cache and (after `dvc push`) in the remote.
+
+> A file cannot be tracked by both Git and DVC. If `dvc add` reports the file is
+> "already tracked by SCM", stop Git tracking it first:
+> `git rm -r --cached data/raw/rides.csv`.
+
+### Step 3 — Define a remote
+
+Remotes are defined in [`.dvc/config`](.dvc/config). `-d` marks a remote as the
+**default** target for `dvc push`/`dvc pull`.
+
+```bash
+# ── Step 3a: an S3 bucket (generic pattern) ───────────
+dvc remote add -d s3remote s3://mlops-dvc-artifacts-ride-duration/data
+dvc remote modify s3remote region us-east-1
+git add .dvc/config && git commit -m "dvc: add S3 remote"
+
+# ── Step 3b: this repo's actual remote is GCS ─────────
+dvc remote add -d gcs gs://mlops-session2-iti/dvc-store
+dvc remote modify gcs credentialpath ../gcp-key.json   # SA key, gitignored
+git add .dvc/config && git commit -m "dvc: add GCS remote"
+```
+
+S3 access keys are secrets, so keep them out of the committed config — put them in
+the git-ignored `.dvc/config.local`:
+
+```bash
+dvc remote modify --local s3 access_key_id     YOUR_KEY
+dvc remote modify --local s3 secret_access_key YOUR_SECRET
+```
+
+### Step 4 — Push data to the remote
+
+```bash
+# ── Step 4: Push data to the remote ───────────────────
+dvc push                      # upload all tracked data to the default remote
+dvc push -r gcs               # …or target a specific remote
+dvc push data/processed/      # …or push only a specific folder
+git push                      # push the .dvc pointers to GitHub
+```
+
+Always pair `dvc push` (bytes → remote) with `git push` (pointers → GitHub) so
+the two stay in sync.
+
+### Step 5 — Pull data on another machine (or in CI)
+
+```bash
+# ── Step 5: On any other machine — pull the data ──────
+git clone https://github.com/you/ride-duration
+cd ride-duration
+dvc pull                      # downloads the data matching the checked-out commit
+# → you now have byte-identical data to what was committed
+```
+
+### Versioning: tie data to a git tag
+
+Because the data hash lives in a git-tracked pointer, a **git tag captures a data
+version too** — checking out the tag later restores that exact dataset.
+
+```bash
+# v1.0: 500k rows of training data
+git tag -a v1.0 -m "baseline model — 500k rows"
+git push origin v1.0
+
+# Update dataset to 1M rows
+dvc add data/raw/rides.csv           # new content hash written into the .dvc file
+git add data/raw/rides.csv.dvc
+git commit -m "data: expand to 1M rows"
+git tag -a v2.0 -m "retrained — 1M rows"
+git push origin v2.0 && dvc push
+```
+
+### Switch between data versions instantly
+
+```bash
+git checkout v1.0     # code + .dvc pointers go back to v1
+dvc checkout          # data files on disk are swapped to match v1
+
+git checkout v2.0
+dvc checkout          # data files swapped to match v2
+```
+
+`git checkout` moves the *pointers*; `dvc checkout` reconciles the *files* on
+disk to whatever those pointers reference (pulling from cache/remote as needed).
+
+### Multiple remotes for different environments
+
+```bash
+dvc remote add local_cache /mnt/fast-ssd/dvc-cache
+dvc remote add s3prod      s3://prod-bucket/dvc
+dvc remote add s3staging   s3://staging-bucket/dvc
+
+# Push / pull to a specific remote with -r
+dvc push -r s3staging     # push to staging only
+dvc push -r s3prod        # push to production
+dvc pull -r local_cache   # fast local pull during dev
+```
+
+### Inspect what DVC is tracking
+
+```bash
+dvc status                # what's out of sync between workspace, cache, and remote?
+dvc diff v1.0 v2.0        # compare tracked data between two git tags
+dvc remote list           # show configured remotes and their URLs
+```
+
+### Pushing data & model artifacts to GCS (end-to-end)
+
+This sends **tracked data** (via DVC) and **registered-model artifacts** (via the
+MLflow server) to `gs://mlops-session2-iti`, which has two prefixes:
+
+```
+gs://mlops-session2-iti/
+├── dvc-store/   ← DVC data lands here   (dvc push -r gcs)
+└── mlflow/      ← MLflow artifacts here (the tracking server writes these)
+```
+
+The client/training code never changes and never needs GCP credentials — only the
+DVC CLI and the MLflow **server** authenticate to the bucket, both reading the same
+service-account key.
+
+**Step 1 — Get a service-account key** with `roles/storage.objectAdmin` on the
+bucket, saved as `./gcp-key.json` (git-ignored). Either via **Cloud Console** (IAM
+& Admin → Service Accounts → Keys → Add key → JSON) or the CLI:
+
+```bash
+gcloud iam service-accounts keys create ./gcp-key.json \
+  --iam-account=YOUR_SA@YOUR_PROJECT.iam.gserviceaccount.com
+```
+
+**Step 2 — Install the GCS extra & push data:**
+
+```bash
+pip install -e ".[gcs]"           # adds dvc[gs]
+dvc push -r gcs                   # uploads data → gs://…/dvc-store/
+dvc pull -r gcs                   # (later, on another machine) pulls it back
+dvc remote default gcs            # make gcs the default so a bare `dvc push` targets it
+```
+
+**Step 3 — Push model artifacts via the GCS-backed MLflow server:**
+
+```bash
+cp .env.gcs.example .env                        # bucket + key path (defaults fit)
+docker compose -f docker-compose.gcs.yml up -d  # UI at http://localhost:5000
+python mlflow_example.py                         # trains + registers → gs://…/mlflow/
+```
+
+**Step 4 — Verify it landed:**
+
+```bash
+python mlflow_gcs_registry_example.py            # loads models:/…@champion back
+gcloud storage ls -r gs://mlops-session2-iti/dvc-store/
+gcloud storage ls -r gs://mlops-session2-iti/mlflow/
+```
+
+> **Never commit** `gcp-key.json` or the real `.env` — both are git-ignored. Only
+> `.env.gcs.example` and the `credentialpath` *pointer* in `.dvc/config` are
+> committed (a path is not a secret; the key file it points to is). As an
+> alternative to a key file, authenticate with
+> `gcloud auth application-default login` and drop `credentialpath`.
+
+---
+
+## 4. Code quality (Ruff, Black & pre-commit)
+
+### Ruff — linter + formatter
+
+[Ruff](https://docs.astral.sh/ruff/) is an extremely fast Python **linter and
+formatter** (written in Rust) that replaces the older Flake8 + **Black** + isort
+stack with a single tool. It runs as two separate concerns:
+
+```bash
+ruff check src/ tests/           # the LINTER
+ruff format --check src/ tests/  # the FORMATTER (verify-only)
+```
+
+**The main commands (the ones you'll use every day):**
+
+```bash
+ruff check .          # lint the whole project (report issues)
+ruff check --fix .    # lint AND auto-fix everything it safely can
+ruff format .         # format every file in place
+ruff format --check . # verify formatting only, don't write (what CI runs)
+```
+
+| Command | Does |
+|---------|------|
+| `ruff check .` | Report lint problems across the project |
+| `ruff check --fix .` | Report **and auto-fix** the safe ones |
+| `ruff format .` | Reformat all files to the canonical style |
+| `ruff format --check .` | Fail if anything isn't already formatted (CI mode) |
+
+> Everyday loop before a commit: **`ruff check --fix . && ruff format .`** — fix
+> lint issues, then normalise layout. (Both also run automatically via
+> [pre-commit](#pre-commit-hooks).) The exhaustive flag list is below.
+
+**What is "linting"?** Linting is static analysis — a tool reads your source code
+*without running it* and flags likely bugs, suspicious constructs, and style-guide
+violations. It catches problems early, before they reach review or production.
+
+The two commands look similar but check completely different things:
+
+| | `ruff check` | `ruff format --check` |
+|---|--------------|-----------------------|
+| Role | **Linter** | **Formatter** (verify-only) |
+| Concerned with | *What the code does* | *How the code is arranged* |
+| Catches | Unused imports/variables, undefined names, mutable default args, unreachable code, PEP 8 violations, common bugs | Whitespace, indentation, quote style, line length, trailing commas not matching the canonical style |
+| In CI, fails when | Code has lint errors | Code isn't already formatted |
+| Fix it with | `ruff check --fix` | `ruff format` (drops `--check` → rewrites files) |
+
+`--check` matters: `ruff format` on its own **rewrites** your files, but
+`ruff format --check` **changes nothing** — it only verifies and exits non-zero if
+not formatted. That's why CI uses `--check`: it enforces formatting without
+modifying the checkout.
+
+**Most important Ruff commands:**
+
+```bash
+# ── Linting (code quality) ────────────────────────────────────────────
+ruff check src/ tests/           # report lint issues (what CI runs)
+ruff check .                     # lint the whole project
+ruff check --fix .               # auto-fix everything it safely can
+ruff check --fix --unsafe-fixes .# also apply fixes that may change behaviour
+ruff check --watch .             # re-lint continuously as you edit
+ruff check --select I --fix .    # fix only a rule group (I = import sorting)
+ruff check --statistics .        # count violations grouped by rule
+ruff check --add-noqa .          # insert `# noqa` comments on existing issues
+
+# ── Formatting (layout) ───────────────────────────────────────────────
+ruff format src/ tests/          # reformat files in place
+ruff format .                    # format the whole project
+ruff format --check .            # verify only, don't write (what CI runs)
+ruff format --diff .             # show the changes it *would* make
+
+# ── Housekeeping ──────────────────────────────────────────────────────
+ruff --version                   # print the installed version
+ruff rule F401                   # explain a specific rule (F401 = unused import)
+ruff clean                       # clear Ruff's cache
+```
+
+Typical local loop before a commit: **`ruff check --fix .`** then
+**`ruff format .`** — the first fixes lint issues, the second normalises layout.
+Suppress a single unavoidable warning inline with `# noqa: <RULE>`
+(e.g. `import os  # noqa: F401`).
+
+### A note on Black
+
+This repo uses **`ruff format`, which is a drop-in replacement for Black** — same
+formatting style, same defaults, far faster, and it shares config with the linter.
+So there is no separate Black step. If you specifically prefer the Black tool, it's
+compatible and you can run it standalone:
+
+```bash
+pip install black
+black src/ tests/                # reformat in place (equivalent to `ruff format`)
+black --check --diff src/ tests/ # verify only + show the diff (like CI)
+```
+
+Pick one formatter, not both — running Black and `ruff format` together just does
+the same work twice.
+
+### Pre-commit hooks
+
+The repo uses [pre-commit](https://pre-commit.com/) to run automated checks before
+a commit (and, for the test suite, before a push). The config
+([`.pre-commit-config.yaml`](.pre-commit-config.yaml)) lives at the git root, so it
+covers every session. If a hook fails or modifies a file, the commit is aborted so
+you can review, re-stage, and try again — bad code never reaches history.
+
+**Enable it (once per clone):**
+
+```bash
+pip install pre-commit
+pre-commit install                        # hooks run on `git commit`
+pre-commit install --hook-type pre-push   # also run the pre-push hooks
+pre-commit run --all-files                # run everything now, across the repo
+```
+
+**What the hooks do.** There are two speed tiers: fast static checks run on every
+commit, while the slow test suite runs only on push — so per-commit feedback stays
+fast but broken tests can't reach the remote.
+
+*Ruff — linter + formatter (Rust-fast; replaces flake8 + Black + isort)*
+
+| Hook            | Purpose                                                                                                   |
+|-----------------|-----------------------------------------------------------------------------------------------------------|
+| `ruff (--fix)`  | Flags unused imports, bad style, likely bugs; auto-fixes what it safely can. Commit aborts if it changed files, so you review + re-stage. |
+| `ruff-format`   | Reflows code to a consistent style (indentation, quotes, line length).                                    |
+
+*Generic hygiene hooks (from the pre-commit project)*
+
+| Hook                                    | Purpose                                                                        |
+|-----------------------------------------|--------------------------------------------------------------------------------|
+| `trailing-whitespace`                   | Strip trailing spaces at line ends.                                            |
+| `end-of-file-fixer`                     | Ensure files end with exactly one newline.                                     |
+| `mixed-line-ending (--fix=lf)`          | Normalise CRLF/LF so Windows/mac edits agree.                                  |
+| `check-yaml` / `check-toml` / `check-json` | Validate config files parse — fail early, not at runtime.                   |
+| `check-merge-conflict`                  | Block commits that still contain `<<<<<<<` markers.                            |
+| `check-added-large-files (--maxkb=500)` | Stop big blobs entering git — the DVC guardrail: data belongs in DVC, not git. |
+| `check-ast`                             | Confirm every `.py` file parses (valid syntax).                                |
+| `debug-statements`                      | Catch leftover `breakpoint()` / `pdb.set_trace()`.                             |
+| `check-executables-have-shebangs`       | An executable (`+x`) file must have a shebang.                                 |
+| `detect-private-key`                    | Block accidentally committing an SSH/PEM key.                                  |
+
+*Local pytest hook (runs at the pre-push stage only)*
+
+Actually executes the session_2 test suite (`cd session_2 && pytest`) to verify
+behaviour. Because it's slower, it runs on `git push` — not on every commit — and
+always runs the whole suite. Requires the dev deps: `pip install -e ".[dev]"`.
+
+> Because that hook shells out to the `pytest` on your `PATH`, activate the venv
+> (`source .venv/bin/activate`) before `git push`, or the push fails with
+> `pytest: command not found`.
+
+**Maintenance.** Bump the pinned hook versions anytime with `pre-commit autoupdate`.
+
+### Running tests directly
 
 ```bash
 pip install -e ".[dev]"
 pytest
 ```
 
-The suite exercises `src/train.py` only (data generation, split, training,
-evaluation) — it does **not** require a running MLflow server.
+The suite exercises `src/train.py` (data generation, split, training, evaluation)
+plus an end-to-end integration test — it does **not** require a running MLflow
+server. CI enforces a 50% coverage gate.
+
+---
+
+## 5. Infrastructure with Terraform
+
+The `infra/` folder provisions the cloud storage this project depends on. It
+currently creates a **GCS bucket** (the AWS S3/ECR resources are kept in
+[`main.tf`](infra/main.tf) but commented out after the migration to GCP):
+
+- **GCS bucket** (GCP) — remote storage for MLflow + DVC artifacts
+  (`mlops-artifacts-<project_name>`, uniform access + object versioning).
+
+```
+infra/
+├── main.tf          # providers (google; aws commented), GCS bucket, outputs
+├── variables.tf     # input variables (project_name, gcp_project, gcp_region)
+├── terraform.tfvars # real values (set gcp_project to your project ID)
+└── commands.md      # Terraform command cheatsheet
+```
+
+Requires the [Terraform CLI](https://developer.hashicorp.com/terraform/install)
+and the `gcloud` CLI authenticated with Application Default Credentials.
+
+### Set up the `gcloud` CLI (one-time)
+
+The `google` provider authenticates with **Application Default Credentials
+(ADC)**, which `gcloud` writes to disk:
+
+```bash
+# 1. Log in and pick the active project
+gcloud init                             # interactive: login + choose project
+# or non-interactively:
+gcloud auth login                       # browser login (your user identity)
+gcloud config set project YOUR_PROJECT_ID
+
+# 2. Write Application Default Credentials for Terraform / SDKs to use
+gcloud auth application-default login    # what `terraform apply` reads
+
+# 3. Enable the API Terraform needs (once per project)
+gcloud services enable storage.googleapis.com
+```
+
+> `gcloud auth login` authenticates the **CLI** (for `gcloud storage ls`, etc.);
+> `gcloud auth application-default login` authenticates **libraries and tools**
+> like Terraform. You typically run both. In CI, use a service-account key
+> (`GOOGLE_APPLICATION_CREDENTIALS=./gcp-key.json`) instead of interactive login.
+
+### Standard Terraform workflow
+
+```bash
+cd infra
+
+# 1. Initialise — download providers, setup backend
+terraform init
+
+# 2. Format — auto-format all .tf files
+terraform fmt
+
+# 3. Validate — check syntax without calling the cloud provider
+terraform validate
+
+# 4. Plan — preview what will change (read-only)
+terraform plan -out=tfplan
+
+# 5. Apply — create/update resources
+terraform apply tfplan
+
+# 6. Show outputs (e.g. the created bucket name)
+terraform output gcs_bucket_name
+
+# 7. Destroy — tear everything down (be careful!)
+terraform destroy
+```
+
+> Bucket names are **globally unique** across all of GCS — if
+> `mlops-artifacts-<project_name>` is taken, change `project_name` (or the name
+> prefix in `main.tf`). `force_destroy = false`, so `terraform destroy` won't
+> delete a non-empty bucket; empty it first (or flip the flag) to tear it down.
+
+---
 
 ## Serving the model (inference API)
 
@@ -335,13 +927,13 @@ curl -X POST localhost:8000/predict \
 The Docker image deliberately does **not** bake in a model. `serve.py` loads the
 model from `MODEL_PATH` at startup, so the image carries only the app + its
 dependencies and you supply the model as a **read-only bind mount** when you run
-it. This is the standard production pattern — the model artifact is decoupled
-from the code artifact:
+it. This is the standard production pattern — the model artifact is decoupled from
+the code artifact:
 
 - **One image serves any model version.** Roll a new model out (or roll back) by
   mounting a different file — no rebuild, no redeploy of the image.
-- **Retraining never rebuilds the image.** Training and serving evolve on
-  separate cadences.
+- **Retraining never rebuilds the image.** Training and serving evolve on separate
+  cadences.
 - **Smaller, immutable images** whose contents don't depend on which model is
   current.
 
@@ -358,8 +950,8 @@ docker run -p 8000:8000 \
 ```
 
 **Where does the mounted model come from?** Pull the latest blessed model from
-your **model registry** first, then mount whatever you fetched. For example,
-with the MLflow registry from this session (`@champion` alias):
+your **model registry** first, then mount whatever you fetched. For example, with
+the MLflow registry from this session (`@champion` alias):
 
 ```bash
 # Fetch the current champion from the registry into ./models/rf_model.pkl
@@ -375,10 +967,8 @@ docker run -p 8000:8000 \
 ```
 
 In a real deployment the same idea applies: an init container / entrypoint runs
-`dvc pull` or an `mlflow`/registry download to place the blessed model on a
-volume, and the serving container mounts it via `MODEL_PATH`. See
-[`mlflow_s3_registry_example.py`](mlflow_s3_registry_example.py) for the registry
-fetch side.
+`dvc pull` or an `mlflow`/registry download to place the blessed model on a volume,
+and the serving container mounts it via `MODEL_PATH`.
 
 ### Multi-stage build — why the `builder` stage matters
 
@@ -392,109 +982,25 @@ image is built* from *what actually ships*:
 
 The builder stage does all the messy work — running `pip install`, downloading
 wheels, compiling — inside a throwaway image. The runtime stage then copies over
-just the ready-to-use virtualenv and nothing else. Think of it as **kitchen vs.
-plate**: you cook in the kitchen (builder) and carry only the finished meal
-(`/opt/venv`) to the plate (runtime) the user actually gets.
+just the ready-to-use virtualenv and nothing else. Think **kitchen vs. plate**: you
+cook in the kitchen (builder) and carry only the finished meal (`/opt/venv`) to the
+plate (runtime) the user actually gets. The payoff: a smaller, cleaner final image;
+a smaller attack surface (no pip cache or build cruft, plus a non-root `appuser`);
+better layer caching; and reproducible, decoupled builds.
 
-Why this is worth the extra stage:
+---
 
-- **Smaller, cleaner final image.** pip caches, build tooling, `pyproject.toml`,
-  `README.md`, and the raw `src/` tree stay in the builder and are discarded —
-  only the installed venv lands in production.
-- **Smaller attack surface.** No pip cache or build cruft to exploit or leak.
-  Combined with the non-root `appuser`, the runtime image is a lean deployable.
-- **Better layer caching.** Dependencies install in their own layer that stays
-  cached until they actually change, so rebuilds are faster.
-- **Reproducible, decoupled builds.** The heavy install happens once in the
-  builder; the runtime is just a copy step.
-
-This is independent of the code-only design above: the builder/runtime split
-keeps the image *slim*, while mounting the model at run time keeps it
-*model-agnostic* — two separate wins.
-
-## Continuous Integration / Delivery (GitHub Actions)
+## 6. CI/CD (GitHub Actions)
 
 The pipeline is defined in **`.github/workflows/ci_cd.yml`** at the **repository
 root** (`mlops_sessions/`), not inside `session_2/` — GitHub only discovers
 workflows at the repo root. Every `run:` step is scoped to `session_2/` via
 `defaults.run.working-directory`.
 
-| Job              | Trigger                              | What it does                                   |
-|------------------|--------------------------------------|------------------------------------------------|
-| `lint-and-test`  | push to `main`/`develop`, PR to `main` | Ruff lint/format check, pytest + 50% coverage  |
-| `build-and-push` | push to `main` only                  | Build the **code-only** image and push to Docker Hub |
-
-### Code quality with Ruff
-
-[Ruff](https://docs.astral.sh/ruff/) is an extremely fast Python **linter and
-formatter** (written in Rust) that replaces the older Flake8 + Black + isort
-stack with a single tool. The `lint-and-test` job runs it in two separate steps,
-each doing a different job:
-
-```bash
-ruff check src/ tests/           # the LINTER
-ruff format --check src/ tests/  # the FORMATTER (verify-only)
-```
-
-**What is "linting"?** Linting is static analysis — a tool reads your source
-code *without running it* and flags likely bugs, suspicious constructs, and
-style-guide violations. The name comes from a 1978 Unix tool called `lint` that
-scanned C code for "fluff." It catches problems early, before they reach review
-or production.
-
-The two commands look similar but check completely different things:
-
-| | `ruff check` | `ruff format --check` |
-|---|--------------|-----------------------|
-| Role | **Linter** | **Formatter** (verify-only) |
-| Concerned with | *What the code does* | *How the code is arranged* |
-| Catches | Unused imports/variables, undefined names, mutable default args, unreachable code, PEP 8 rule violations, common bugs | Whitespace, indentation, quote style, line length, trailing commas not matching the canonical style |
-| In CI, fails when | Code has lint errors | Code isn't already formatted |
-| Fix it with | `ruff check --fix` | `ruff format` (drops `--check` → rewrites files) |
-
-Key point about `--check`: `ruff format` on its own **rewrites** your files to
-the canonical style, but `ruff format --check` **changes nothing** — it only
-verifies the files are already formatted and exits non-zero if not. That's why
-CI uses `--check`: it enforces formatting without modifying the checkout.
-
-Ruff ships with `pip install -e ".[dev]"`; run it standalone with
-`pip install ruff` or `brew install ruff`.
-
-**Most important Ruff commands** (they're also wired into
-[`.pre-commit-config.yaml`](.pre-commit-config.yaml) so they run on every
-commit — run them locally before pushing to keep CI green):
-
-```bash
-# ── Linting (code quality) ────────────────────────────────────────────
-ruff check src/ tests/           # report lint issues (what CI runs)
-ruff check .                     # lint the whole project
-ruff check --fix .               # auto-fix everything it safely can
-ruff check --fix --unsafe-fixes .# also apply fixes that may change behaviour
-ruff check --watch .             # re-lint continuously as you edit
-ruff check --select I --fix .    # fix only a rule group (I = import sorting)
-ruff check --statistics .        # count violations grouped by rule
-ruff check --add-noqa .          # insert `# noqa` comments on existing issues
-
-# ── Formatting (layout) ───────────────────────────────────────────────
-ruff format src/ tests/          # reformat files in place
-ruff format .                    # format the whole project
-ruff format --check .            # verify only, don't write (what CI runs)
-ruff format --diff .             # show the changes it *would* make
-
-# ── Housekeeping ──────────────────────────────────────────────────────
-ruff --version                   # print the installed version
-ruff rule F401                   # explain a specific rule (F401 = unused import)
-ruff clean                       # clear Ruff's cache
-```
-
-Typical local loop before a commit: **`ruff check --fix .`** then
-**`ruff format .`** — the first fixes lint issues, the second normalises layout.
-Suppress a single unavoidable warning inline with a `# noqa: <RULE>` comment
-(e.g. `import os  # noqa: F401`).
-
-> There's a small overlap — `ruff check` includes some formatting-related rules —
-> but the intended division is: `ruff format` owns all layout decisions, and
-> `ruff check` owns everything else (correctness and code quality).
+| Job              | Trigger                                | What it does                                          |
+|------------------|----------------------------------------|-------------------------------------------------------|
+| `lint-and-test`  | push to `main`/`develop`, PR to `main` | Ruff lint/format check, pytest + 50% coverage         |
+| `build-and-push` | push to `main` only                    | Build the **code-only** image and push to Docker Hub  |
 
 ### 1. Required secrets
 
@@ -521,8 +1027,8 @@ Notes:
 - `CODECOV_TOKEN` is optional — the upload step has `fail_ci_if_error: false`, so
   CI stays green without it. `lint-and-test` needs **no** secrets to run.
 
-Set them from the terminal with the GitHub CLI (must be authenticated as the
-repo owner — check with `gh auth status`):
+Set them from the terminal with the GitHub CLI (must be authenticated as the repo
+owner — check with `gh auth status`):
 
 ```bash
 gh secret set DOCKERHUB_USERNAME --body "your-dockerhub-username"
@@ -535,8 +1041,8 @@ gh secret list                     # verify
 ### 2. Build & verify the Docker image locally (before triggering CI)
 
 The `build-and-push` job just automates these steps — running them by hand first
-confirms the image builds, serves correctly, and that your Docker Hub token
-works, before you rely on CI.
+confirms the image builds, serves correctly, and that your Docker Hub token works,
+before you rely on CI.
 
 ```bash
 cd session_2
@@ -561,8 +1067,8 @@ docker tag ride-api:local <your-dockerhub-username>/ride-api:test
 docker push <your-dockerhub-username>/ride-api:test
 ```
 
-In CI the same build runs via `docker/build-push-action`, tagging every image
-two ways and reusing cached layers (`cache-from: …:latest`):
+In CI the same build runs via `docker/build-push-action`, tagging every image two
+ways and reusing cached layers (`cache-from: …:latest`):
 
 | Tag                       | Example                      | Purpose                        |
 |---------------------------|------------------------------|--------------------------------|
@@ -571,8 +1077,8 @@ two ways and reusing cached layers (`cache-from: …:latest`):
 
 ### 3. Trigger the pipeline
 
-The workflow fires automatically on the events in its `on:` block — you trigger
-it with ordinary git pushes / PRs, there is no button to click:
+The workflow fires automatically on the events in its `on:` block — you trigger it
+with ordinary git pushes / PRs, there is no button to click:
 
 | Event                    | How you cause it                        | Jobs that run                      |
 |--------------------------|-----------------------------------------|------------------------------------|
@@ -595,13 +1101,11 @@ gh pr create --base main --fill          # or use the link git prints on push
 gh pr merge --squash --delete-branch
 ```
 
-> `build-and-push` is gated on `if: github.ref == 'refs/heads/main'`, so the
-> image is published **only after merge to `main`**, never from a PR — unreviewed
-> code never reaches your registry.
+> `build-and-push` is gated on `if: github.ref == 'refs/heads/main'`, so the image
+> is published **only after merge to `main`**, never from a PR — unreviewed code
+> never reaches your registry.
 
-There's no `workflow_dispatch` trigger, so the Actions tab has no *Run workflow*
-button. To enable manual runs, add `workflow_dispatch:` under `on:` in
-`ci_cd.yml`:
+To enable manual runs, add `workflow_dispatch:` under `on:` in `ci_cd.yml`:
 
 ```yaml
 on:
@@ -620,8 +1124,8 @@ gh run watch                 # live-tail the in-progress run
 gh run view --log-failed     # show logs for only the failed steps
 ```
 
-Or open the repo's **Actions** tab in the browser. After a successful `main`
-build, the image appears on Docker Hub under `<your-username>/ride-api`.
+Or open the repo's **Actions** tab in the browser. After a successful `main` build,
+the image appears on Docker Hub under `<your-username>/ride-api`.
 
 ### 5. Dry-run the workflow locally with `act` (optional)
 
@@ -631,316 +1135,4 @@ From the **repo root** (where `act` finds `.github/workflows/`):
 cd ..                                    # into mlops_sessions/
 act -l                                   # list detected jobs
 act pull_request -j lint-and-test        # run the test job in Docker
-```
-
-## DVC pipeline
-
-The reproducible training pipeline is defined in [`dvc.yaml`](dvc.yaml) (at the
-project root) as three stages:
-
-| Stage      | Command              | Inputs                                   | Outputs                         |
-|------------|----------------------|------------------------------------------|---------------------------------|
-| `prepare`  | `python src/prepare.py`  | `data/raw/rides.csv`, `config/config.yaml` | `data/processed/{train,val}.parquet` |
-| `train`    | `python src/train.py`    | `train.parquet`, `model.*` params        | `models/rf_model.pkl`           |
-| `evaluate` | `python src/evaluate.py` | `rf_model.pkl`, `val.parquet`            | `metrics/scores.json`           |
-
-All hyperparameters live in [`config/config.yaml`](config/config.yaml); the
-`train` stage tracks `model.n_estimators` and `model.max_depth` as DVC params,
-so changing them invalidates the cache and triggers a re-run. Every stage's
-recorded input/output hashes live in [`dvc.lock`](dvc.lock) — commit it so the
-pipeline is reproducible for everyone.
-
-Because `dvc.yaml` sits at the project root, all commands run without a path
-argument. Install DVC and run the pipeline from the project root:
-
-```bash
-pip install -e ".[dvc]"           # DVC + remote support
-
-dvc init --subdir                 # one-time, initialises DVC in session_2/
-
-dvc repro                         # run prepare → train → evaluate
-dvc status                        # show which stages are stale (deps changed)
-dvc dag                           # visualise the stage graph
-dvc metrics show                  # print metrics/scores.json
-```
-
-Re-running `dvc repro` only re-executes stages whose dependencies changed.
-
-### Tracking the raw data
-
-The raw dataset is tracked by DVC (pointer file `data/raw/rides.csv.dvc`), not
-by Git. When the CSV changes, re-add it and push the new version:
-
-```bash
-dvc add data/raw/rides.csv        # update the .dvc pointer + cache
-git add data/raw/rides.csv.dvc    # commit the pointer, not the CSV
-```
-
-> A file cannot be tracked by both Git and DVC. If `dvc add` reports the file is
-> "already tracked by SCM", stop Git tracking it first:
-> `git rm -r --cached data/raw/rides.csv`.
-
-### Remote storage
-
-Remotes are defined in [`.dvc/config`](.dvc/config). Three are configured — a
-local directory (the default), a GCS bucket (`gs://mlops-session2-iti/dvc-store`),
-and an S3 bucket:
-
-```bash
-dvc remote list                   # local (default), gcs, s3
-
-dvc push                          # push to the default (local) remote
-dvc push -r gcs                   # push tracked data to the GCS bucket
-dvc push -r s3                    # push to the S3 bucket
-dvc pull -r gcs                   # pull tracked data/models back from GCS
-```
-
-**Pushing tracked data to GCS.** Install the GCS extra, point DVC at a
-service-account key, and push:
-
-```bash
-pip install -e ".[gcs]"           # pulls in dvc[gs]
-
-# The gcs remote in .dvc/config already points credentialpath at ./gcp-key.json.
-# Drop a key with roles/storage.objectAdmin on the bucket there (gitignored),
-# then:
-dvc push -r gcs                   # uploads data/raw/rides.csv → gs://…/dvc-store/
-```
-
-Set or change a remote (and keep it the default with `-d`):
-
-```bash
-dvc remote add -d gcs gs://mlops-session2-iti/dvc-store
-dvc remote modify gcs url gs://my-bucket/dvc-store   # change the URL
-```
-
-A key *path* (`credentialpath`) is not itself a secret, so it can live in the
-committed `.dvc/config`. The **key file** must never be committed — `gcp-key.json`
-is git-ignored. As alternatives to a key file you can authenticate with
-`gcloud auth application-default login` (drop `credentialpath` and DVC uses your
-ADC), and S3 keys go in the git-ignored `.dvc/config.local`:
-
-```bash
-dvc remote modify --local s3 access_key_id     YOUR_KEY
-dvc remote modify --local s3 secret_access_key YOUR_SECRET
-```
-
-The `infra/` Terraform provisions an S3 bucket
-(`mlops-dvc-artifacts-<project_name>`) you can point the `s3` remote at; the GCS
-bucket (`mlops-session2-iti`) is managed outside Terraform here.
-
-## Pushing models & data to GCS (end-to-end)
-
-This is the complete walkthrough for sending **tracked data** (via DVC) and
-**registered-model artifacts** (via MLflow) to the Google Cloud Storage bucket
-`gs://mlops-session2-iti`, which has two prefixes:
-
-```
-gs://mlops-session2-iti/
-├── dvc-store/   ← DVC data lands here   (dvc push -r gcs)
-└── mlflow/      ← MLflow artifacts here (the tracking server writes these)
-```
-
-The client/training code never changes and never needs GCP credentials — only the
-DVC CLI and the MLflow **server** authenticate to the bucket. Both read the same
-service-account key.
-
-### Step 1 — Get a service-account key
-
-The key is a JSON file with **`roles/storage.objectAdmin`** on the bucket. Create
-it either way, then save it as **`./gcp-key.json`** in `session_2/` (already
-git-ignored — never commit it).
-
-**Option A — Cloud Console (no CLI to install):**
-
-1. **IAM & Admin → Service Accounts** → create or pick a service account.
-2. Grant it **Storage Object Admin** on bucket `mlops-session2-iti`
-   (IAM & Admin → grant role `roles/storage.objectAdmin`).
-3. On the service account → **Keys → Add key → Create new key → JSON** → download.
-4. Move the downloaded file to `session_2/gcp-key.json`.
-
-**Option B — gcloud CLI** (install with `brew install --cask google-cloud-sdk`;
-it is a system tool, **not** a `pip`/venv package):
-
-```bash
-gcloud init                                   # login + select project
-gcloud iam service-accounts keys create ./gcp-key.json \
-  --iam-account=YOUR_SA@YOUR_PROJECT.iam.gserviceaccount.com
-```
-
-### Step 2 — Install the GCS extras
-
-```bash
-pip install -e ".[gcs]"     # adds dvc[gs] for the DVC remote
-```
-
-(The MLflow server installs `google-cloud-storage` itself on startup — see
-`docker-compose.gcs.yml` — so nothing extra is needed in the venv for it.)
-
-### Step 3 — Push tracked DATA with DVC
-
-The `gcs` remote in [`.dvc/config`](.dvc/config) already points at
-`gs://mlops-session2-iti/dvc-store` with `credentialpath = ./gcp-key.json`:
-
-```bash
-# Make sure the data is tracked (already committed for this repo):
-dvc add data/raw/rides.csv        # only if not already tracked
-
-dvc push -r gcs                   # uploads data → gs://…/dvc-store/
-dvc pull -r gcs                   # (later, on another machine) pulls it back
-```
-
-To make `gcs` the default remote so a bare `dvc push` targets it:
-
-```bash
-dvc remote default gcs
-```
-
-### Step 4 — Push MODEL ARTIFACTS with MLflow
-
-Start the GCS-backed tracking server, then register a model as usual — its
-artifacts land in `gs://…/mlflow/`:
-
-```bash
-cp .env.gcs.example .env                        # bucket + key path (defaults fit)
-docker compose -f docker-compose.gcs.yml up -d  # UI at http://localhost:5000
-
-python mlflow_example.py                         # trains + registers a version
-```
-
-The server writes `model.skops`, plots, etc. to `gs://mlops-session2-iti/mlflow/…`.
-The registry metadata (versions, `@champion`) stays in SQLite (in the
-bind-mounted `mlflow-gcs-data/` directory so it survives `docker compose down`) — object storage holds files,
-not rows.
-
-### Step 5 — Verify it landed in the bucket
-
-```bash
-python mlflow_gcs_registry_example.py     # loads models:/…@champion back
-```
-
-Set the two env vars first and the script also lists the raw objects under
-`gs://…/mlflow/` to prove they're physically there:
-
-```bash
-export MLFLOW_GCS_BUCKET=mlops-session2-iti
-export GOOGLE_APPLICATION_CREDENTIALS=./gcp-key.json
-python mlflow_gcs_registry_example.py
-```
-
-Or inspect directly (Console → the bucket, or `gcloud storage ls` if you installed
-the CLI):
-
-```bash
-gcloud storage ls -r gs://mlops-session2-iti/dvc-store/
-gcloud storage ls -r gs://mlops-session2-iti/mlflow/
-```
-
-> **Never commit** `gcp-key.json` or the real `.env` — both are git-ignored.
-> Only `.env.gcs.example` and the `credentialpath` *pointer* in `.dvc/config` are
-> committed (a path is not a secret; the key file it points to is).
-
-## Infrastructure (Terraform)
-
-The `infra/` folder provisions the cloud resources this project depends on
-across **AWS** and **GCP**:
-
-- **S3 bucket** (AWS) — remote storage for DVC artifacts
-  (`mlops-dvc-artifacts-<project_name>`).
-- **ECR repository** (AWS) — registry for the API Docker image
-  (`<project_name>/ride-api`, with scan-on-push enabled).
-- **GCS bucket** (GCP) — remote storage for MLflow + DVC artifacts
-  (`mlops-artifacts-<project_name>`, uniform access + object versioning).
-
-```
-infra/
-├── main.tf          # providers (aws + google), S3 bucket, ECR repo, GCS bucket, outputs
-├── variables.tf     # input variables (project_name, gcp_project, gcp_region)
-├── terraform.tfvars # real values (set gcp_project to your project ID)
-└── commands.md      # Terraform command cheatsheet
-```
-
-Requires the [Terraform CLI](https://developer.hashicorp.com/terraform/install),
-AWS credentials (e.g. via `aws configure` or environment variables), and — for
-the GCS bucket — the `gcloud` CLI authenticated as below.
-
-### Creating the GCS bucket
-
-Set `gcp_project` in [`infra/terraform.tfvars`](infra/terraform.tfvars) to your
-real project ID, authenticate, then run the standard plan/apply:
-
-```bash
-cd infra
-gcloud auth application-default login   # if not already authenticated
-terraform init                          # pulls the google provider
-terraform plan
-terraform apply
-```
-
-`terraform output gcs_bucket_name` prints the bucket name once it's created.
-
-> Bucket names are **globally unique** across all of GCS — if
-> `mlops-artifacts-<project_name>` is taken, change `project_name` (or the name
-> prefix in `main.tf`). `force_destroy = false`, so `terraform destroy` won't
-> delete a non-empty bucket; empty it first (or flip the flag) to tear it down.
-
-### Setting up the `gcloud` CLI
-
-The `google` provider authenticates with **Application Default Credentials
-(ADC)**, which `gcloud` writes to disk. One-time setup:
-
-```bash
-# 1. Install the Google Cloud SDK (it's a system tool, NOT a pip/venv package)
-brew install --cask google-cloud-sdk    # macOS
-# Linux:   curl https://sdk.cloud.google.com | bash && exec -l $SHELL
-# Windows: winget install Google.CloudSDK
-
-gcloud version                          # verify
-
-# 2. Log in and pick the active project
-gcloud init                             # interactive: login + choose project
-# or non-interactively:
-gcloud auth login                       # browser login (your user identity)
-gcloud config set project YOUR_PROJECT_ID
-
-# 3. Write Application Default Credentials for Terraform / SDKs to use
-gcloud auth application-default login    # what `terraform apply` reads
-
-# 4. Enable the API Terraform needs (once per project)
-gcloud services enable storage.googleapis.com
-```
-
-After step 3, `~/.config/gcloud/application_default_credentials.json` exists and
-Terraform's `google` provider picks it up automatically — no key file needed.
-
-> `gcloud auth login` authenticates the **CLI** (for `gcloud storage ls`, etc.);
-> `gcloud auth application-default login` authenticates **libraries and tools**
-> like Terraform. You typically run both. In CI, use a service-account key
-> (`GOOGLE_APPLICATION_CREDENTIALS=./gcp-key.json`) instead of interactive login.
-
-### Standard Terraform workflow
-
-```bash
-cd infra
-
-# 1. Initialise — download providers, setup backend
-terraform init
-
-# 2. Format — auto-format all .tf files
-terraform fmt
-
-# 3. Validate — check syntax without calling AWS
-terraform validate
-
-# 4. Plan — preview what will change (read-only)
-terraform plan -out=tfplan
-
-# 5. Apply — create/update resources
-terraform apply tfplan
-
-# 6. Show outputs (e.g. to get ECR URL for CI)
-terraform output ecr_repo_url
-
-# 7. Destroy — tear everything down (be careful!)
-terraform destroy
 ```
