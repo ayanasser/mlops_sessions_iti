@@ -17,6 +17,13 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
+import json
+from pathlib import Path
+
+import joblib
+import pandas as pd
+
+from src.config import load_config
 
 #: Assumed average speed in km per minute (~30 km/h) — matches session 1.
 AVG_SPEED_KM_PER_MIN = 0.5
@@ -109,6 +116,7 @@ def evaluate(
     rmse = float(np.sqrt(mean_squared_error(y, preds)))
     mae = float(mean_absolute_error(y, preds))
     r2 = float(r2_score(y, preds))
+
     return {"rmse": rmse, "mae": mae, "r2": r2}
 
 
@@ -118,13 +126,6 @@ def main() -> None:
     Reads ``data/processed/train.parquet`` and the ``model`` hyperparameters
     from ``config/config.yaml``, then writes ``models/rf_model.pkl``.
     """
-    import json
-    from pathlib import Path
-
-    import joblib
-    import pandas as pd
-
-    from src.config import load_config
 
     cfg = load_config()
     df = pd.read_parquet("data/processed/train.parquet")

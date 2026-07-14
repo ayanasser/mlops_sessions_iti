@@ -41,8 +41,8 @@ stages:
       size: 475
     - path: src/train.py
       hash: md5
-      md5: 4655544f83238fa29de3dd8713a3da34
-      size: 4644
+      md5: 8778c2c94723a646709d9b8826a73700
+      size: 4752
     params:
       config/config.yaml:
         model.max_depth: 6
@@ -73,8 +73,8 @@ stages:
       size: 876
     - path: src/train.py
       hash: md5
-      md5: 4655544f83238fa29de3dd8713a3da34
-      size: 4644
+      md5: 8778c2c94723a646709d9b8826a73700
+      size: 4752
     outs:
     - path: metrics/scores.json
       hash: md5

@@ -4,10 +4,8 @@
     url = /Users/ayanasser/dvc-remotes/mlops
 ['remote "gcs"']
     url = gs://mlops-session2-iti/dvc-store
-    # Path to the service-account key the DVC client uses to reach the bucket.
-    # NOTE: DVC resolves a relative credentialpath against the .dvc/ folder, so
-    # ../gcp-key.json points at session_2/gcp-key.json (the project root).
-    # Keep the real key out of git (see .gitignore); commit only this pointer.
     credentialpath = ../gcp-key.json
 ['remote "s3"']
     url = s3://my-s3-bucket/dvc-store
+['remote "gcs-stage2"']
+    url = ../aya
