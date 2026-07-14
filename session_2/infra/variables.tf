@@ -4,3 +4,14 @@ variable "project_name" {
   type        = string
   default     = "ride-duration"
 }
+
+variable "gcp_project" {
+  description = "GCP project ID to create resources in"
+  type        = string
+}
+
+variable "gcp_region" {
+  description = "GCP region/location for the GCS bucket"
+  type        = string
+  default     = "us-central1"
+}

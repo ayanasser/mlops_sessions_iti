@@ -33,6 +33,9 @@ from mlflow import MlflowClient
 # Same as always: the client only knows the SERVER address. It has no idea (and
 # doesn't care) that the server stores files in GCS.
 TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+# export MLFLOW_TRACKING_URI=https://mlflow.your-company.internal   # or the VM's http://<ip>:5000
+
+
 MODEL_NAME = "RideDurationModel"
 
 mlflow.set_tracking_uri(TRACKING_URI)

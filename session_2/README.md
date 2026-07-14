@@ -842,22 +842,81 @@ gcloud storage ls -r gs://mlops-session2-iti/mlflow/
 
 ## Infrastructure (Terraform)
 
-The `infra/` folder provisions the AWS resources this project depends on:
+The `infra/` folder provisions the cloud resources this project depends on
+across **AWS** and **GCP**:
 
-- **S3 bucket** — remote storage for DVC artifacts
+- **S3 bucket** (AWS) — remote storage for DVC artifacts
   (`mlops-dvc-artifacts-<project_name>`).
-- **ECR repository** — registry for the API Docker image
+- **ECR repository** (AWS) — registry for the API Docker image
   (`<project_name>/ride-api`, with scan-on-push enabled).
+- **GCS bucket** (GCP) — remote storage for MLflow + DVC artifacts
+  (`mlops-artifacts-<project_name>`, uniform access + object versioning).
 
 ```
 infra/
-├── main.tf          # providers, S3 bucket, ECR repository, outputs
-├── variables.tf     # input variables (project_name)
+├── main.tf          # providers (aws + google), S3 bucket, ECR repo, GCS bucket, outputs
+├── variables.tf     # input variables (project_name, gcp_project, gcp_region)
+├── terraform.tfvars # real values (set gcp_project to your project ID)
 └── commands.md      # Terraform command cheatsheet
 ```
 
-Requires the [Terraform CLI](https://developer.hashicorp.com/terraform/install)
-and AWS credentials (e.g. via `aws configure` or environment variables).
+Requires the [Terraform CLI](https://developer.hashicorp.com/terraform/install),
+AWS credentials (e.g. via `aws configure` or environment variables), and — for
+the GCS bucket — the `gcloud` CLI authenticated as below.
+
+### Creating the GCS bucket
+
+Set `gcp_project` in [`infra/terraform.tfvars`](infra/terraform.tfvars) to your
+real project ID, authenticate, then run the standard plan/apply:
+
+```bash
+cd infra
+gcloud auth application-default login   # if not already authenticated
+terraform init                          # pulls the google provider
+terraform plan
+terraform apply
+```
+
+`terraform output gcs_bucket_name` prints the bucket name once it's created.
+
+> Bucket names are **globally unique** across all of GCS — if
+> `mlops-artifacts-<project_name>` is taken, change `project_name` (or the name
+> prefix in `main.tf`). `force_destroy = false`, so `terraform destroy` won't
+> delete a non-empty bucket; empty it first (or flip the flag) to tear it down.
+
+### Setting up the `gcloud` CLI
+
+The `google` provider authenticates with **Application Default Credentials
+(ADC)**, which `gcloud` writes to disk. One-time setup:
+
+```bash
+# 1. Install the Google Cloud SDK (it's a system tool, NOT a pip/venv package)
+brew install --cask google-cloud-sdk    # macOS
+# Linux:   curl https://sdk.cloud.google.com | bash && exec -l $SHELL
+# Windows: winget install Google.CloudSDK
+
+gcloud version                          # verify
+
+# 2. Log in and pick the active project
+gcloud init                             # interactive: login + choose project
+# or non-interactively:
+gcloud auth login                       # browser login (your user identity)
+gcloud config set project YOUR_PROJECT_ID
+
+# 3. Write Application Default Credentials for Terraform / SDKs to use
+gcloud auth application-default login    # what `terraform apply` reads
+
+# 4. Enable the API Terraform needs (once per project)
+gcloud services enable storage.googleapis.com
+```
+
+After step 3, `~/.config/gcloud/application_default_credentials.json` exists and
+Terraform's `google` provider picks it up automatically — no key file needed.
+
+> `gcloud auth login` authenticates the **CLI** (for `gcloud storage ls`, etc.);
+> `gcloud auth application-default login` authenticates **libraries and tools**
+> like Terraform. You typically run both. In CI, use a service-account key
+> (`GOOGLE_APPLICATION_CREDENTIALS=./gcp-key.json`) instead of interactive login.
 
 ### Standard Terraform workflow
 
