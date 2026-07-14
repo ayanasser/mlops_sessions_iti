@@ -1,0 +1,84 @@
+[project]
+name = "ride-duration-serving"
+version = "0.1.0"
+description = "Session 3 — deploy the ride-duration model: Airflow orchestration, batch scoring, streaming inference, and model serving (BentoML / TorchServe)."
+readme = "README.md"
+# Airflow 3.3 and torch do not ship wheels for 3.13+ yet; 3.12 is the ceiling
+# that every extra below can actually resolve on.
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # Core training/scoring stack used by src/ (prepare.py, train.py, config.py).
+    "scikit-learn>=1.4",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "pyarrow>=15",      # parquet engine for data/processed/train.parquet
+    "pyyaml>=6",        # config/config.yaml loader (src/config.py)
+    "joblib>=1.3",      # model (de)serialization -> models/rf_model.pkl
+]
+
+[project.optional-dependencies]
+# MLflow model registry. Every "load the Production model" call site needs this:
+#   src/batch_scoring.py, main_streaming_inference.py, bentoml_example.py.
+# Install with: pip install -e ".[tracking]"
+tracking = [
+    "mlflow>=2.12",
+]
+# Google Cloud SDKs. Install with: pip install -e ".[gcp]"
+gcp = [
+    "google-cloud-storage>=2.16",    # src/batch_scoring.py, Dags extract task
+    "google-cloud-firestore>=2.16",  # main_streaming_inference.py prediction sink
+]
+# BentoML serving (bentoml_example.py). Pinned <1.2 because the script uses the
+# legacy `bentoml.io` + `bentoml.Service(runners=[...])` API, which was removed
+# in BentoML 1.2 in favour of the `@bentoml.service` class-based API.
+# Install with: pip install -e ".[bentoml]"
+bentoml = [
+    "bentoml>=1.1,<1.2",
+    "pydantic>=1.10",
+    "ride-duration-serving[tracking]",  # loads the model out of the registry
+]
+# TorchServe (torch_serve.py). torch-model-archiver builds the .mar; the `ts`
+# package supplies BaseHandler. Install with: pip install -e ".[torch]"
+torch = [
+    "torch>=2.2",
+    "torchserve>=0.11",
+    "torch-model-archiver>=0.11",
+]
+# Load testing (locustfile.py). Install with: pip install -e ".[load]"
+load = [
+    "locust>=2.25",
+]
+# Airflow, for parsing/linting Dags/ outside the container. The DAGs actually
+# run in the extended Airflow image (see Dockerfile + requirements.txt); this
+# extra only exists so `python -c "import Dags.example_1"` works locally.
+# Install with: pip install -e ".[airflow]"
+airflow = [
+    "apache-airflow==3.3.0",           # matches AIRFLOW_VERSION in Dockerfile
+    "ride-duration-serving[gcp,tracking]",
+]
+# Test/lint tooling. Install with: pip install -e ".[dev]"
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Root on sys.path so tests can import the top-level scripts (locustfile.py,
+# torch_serve.py, ...) that are not part of the installed `src` package.
+pythonpath = ["."]
+
+[tool.ruff.lint.per-file-ignores]
+# Walkthrough script: each "Step" section is a separate file in real use, so the
+# handler's imports deliberately sit mid-file rather than at the top.
+"torch_serve.py" = ["E402"]
+# DAG skeleton: task bodies are elided with `...`, so values pulled from XCom are
+# shown being fetched but not consumed.
+"Dags/example_1.py" = ["F841"]
