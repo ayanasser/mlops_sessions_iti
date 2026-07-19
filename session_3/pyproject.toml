@@ -1,0 +1,90 @@
+[project]
+name = "ride-duration-serving"
+version = "0.1.0"
+description = "Session 3 — deploy the ride-duration model: Airflow orchestration, batch scoring, streaming inference, and model serving (BentoML / TorchServe)."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # Pinned to the version that unpickles the session-2 model cleanly.
+    "scikit-learn==1.9.0",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "pyarrow>=15",      # parquet engine
+    "pyyaml>=6",        # config/config.yaml loader
+    "joblib>=1.3",      # model (de)serialization
+]
+
+[project.optional-dependencies]
+# MLflow tracking + Model Registry (see src/register_model.py). Install with:
+#   pip install -e ".[tracking]"
+tracking = [
+    "mlflow>=2.12",
+]
+# Online-serving stack: FastAPI app in ab_testing.py (A/B + shadow) and the
+# repo-root serving demo. Install with:
+#   pip install -e ".[serve]"
+serve = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+# BentoML packaging path. Install with:
+#   pip install -e ".[bentoml]"
+bentoml = [
+    "bentoml>=1.1,<1.2",
+    "pydantic>=1.10",
+    "ride-duration-serving[tracking]",
+]
+# TorchServe packaging path. Install with:
+#   pip install -e ".[torch]"
+torch = [
+    "torch>=2.2",
+    "torchserve>=0.11",
+    "torch-model-archiver>=0.11",
+]
+# Classical DL serving demo — serve_dl_serving_example.py (ResNet50 + hand-written
+# micro-batcher). Runs anywhere; uses CUDA when present, else CPU. Install with:
+#   pip install -e ".[dl-serve]"
+# Run: uvicorn serve_dl_serving_example:app --host 0.0.0.0 --port 8000 --workers 1
+dl-serve = [
+    "torch>=2.2",
+    "torchvision>=0.17",   # resnet50 + weights + transforms
+    "pillow>=10",          # image decode
+    "python-multipart>=0.0.9",  # required by FastAPI for UploadFile / multipart
+    "ride-duration-serving[serve]",
+]
+# LLM serving demo — serve_llm_vllm_example.py (FastAPI orchestration over vLLM).
+# vLLM ships Linux wheels only (CUDA/ROCm/CPU); there is no macOS distribution,
+# hence the marker — on macOS this extra installs the FastAPI half and vLLM is
+# simply skipped, so the module will not import. Run it on a Linux GPU box.
+# Install with:
+#   pip install -e ".[llm-serve]"
+# Run: uvicorn serve_llm_vllm_example:app --host 0.0.0.0 --port 8000 --workers 1
+llm-serve = [
+    "vllm>=0.6; sys_platform == 'linux'",
+    "transformers>=4.43; sys_platform == 'linux'",  # tokenizer / chat template
+    "ride-duration-serving[serve]",
+]
+# Load testing (see load-test scripts). Install with:
+#   pip install -e ".[load]"
+load = [
+    "locust>=2.25",
+]
+# Airflow orchestration (Dags/). Install with:
+#   pip install -e ".[airflow]"
+airflow = [
+    "apache-airflow==3.3.0",
+    "ride-duration-serving[tracking]",
+]
+# Test/dev tooling. Install with:
+#   pip install -e ".[dev]"
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
