@@ -2,8 +2,8 @@
 
 Session 2 stopped at a *trained, registered* model. Session 3 is about everything
 that happens **after** the model exists: scheduling the pipeline that keeps it
-fresh, choosing how predictions reach consumers, proving the service survives
-real traffic, and putting it on a cloud VM.
+fresh, choosing how predictions reach consumers, packaging the service as a
+container, and proving it survives real traffic.
 
 The model itself is unchanged — the same synthetic **ride-duration** regressor
 (`src/train.py`) from session 2. What changes is the machinery around it.
@@ -14,8 +14,6 @@ The model itself is unchanged — the same synthetic **ride-duration** regressor
 2. [Deployment strategies](#2-deployment-strategies) — [batch scoring](#21-batch-scoring) vs. [streaming inference](#22-streaming-inference)
 3. [Load testing with Locust](#3-load-testing-with-locust) — find the breaking point before users do
 4. [BentoML serving](#4-bentoml-serving) — model → production API → Docker image
-5. [TorchServe](#5-torchserve) — the PyTorch-native serving path
-6. [GCP & cloud basics](#6-gcp--cloud-basics) — ship the container to a real VM, [by hand](#61-the-manual-flow-gcloud-cli) then [with Terraform](#62-the-same-thing-with-terraform)
 
 ## Project structure
 
@@ -25,7 +23,7 @@ session_3/
 ├── Dockerfile                   # extends apache/airflow:3.3.0 with the DAG runtime deps
 ├── requirements.txt             # deps baked into the Airflow image
 ├── .env                         # Airflow local-dev env (UID, Fernet key, admin login)
-├── pyproject.toml               # project deps + optional extras (tracking/gcp/bentoml/torch/load)
+├── pyproject.toml               # project deps + optional extras (tracking/gcp/bentoml/load)
 ├── Dags/
 │   └── example_1.py             # retraining DAG: extract → train → evaluate
 ├── src/
@@ -35,15 +33,7 @@ session_3/
 │   └── batch_scoring.py         # ── batch strategy: GCS parquet in → predictions out
 ├── main_streaming_inference.py  # ── streaming strategy: Pub/Sub-triggered Cloud Function
 ├── bentoml_example.py           # BentoML service (save → serve → build → containerize)
-├── torch_serve.py               # TorchScript export + custom handler + .mar packaging
 ├── locustfile.py                # load-test scenario (90% /predict, 10% /health)
-├── infra/                       # ── Terraform: the gcloud commands, as code
-│   ├── versions.tf              #    provider + (optional) GCS remote state
-│   ├── variables.tf             #    every knob: project, image, port, CIDRs
-│   ├── main.tf                  #    static IP, service account, firewall x2, VM
-│   ├── startup.sh               #    boot script: install Docker, pull, run
-│   ├── outputs.tf               #    external IP, api_url, ready-to-paste curl
-│   └── terraform.tfvars.example #    copy → terraform.tfvars, fill in 2 values
 ├── config/
 │   └── config.yaml              # data + model hyperparameters
 └── data/, logs/, plugins/       # mounted into the Airflow containers
@@ -59,12 +49,11 @@ pip install -e .
 pip install -e ".[tracking]"   # MLflow registry (batch, streaming, BentoML all load from it)
 pip install -e ".[gcp]"        # google-cloud-storage + firestore
 pip install -e ".[bentoml]"    # BentoML serving
-pip install -e ".[torch]"      # TorchServe + torch-model-archiver
 pip install -e ".[load]"       # Locust
 pip install -e ".[airflow]"    # only to parse/lint DAGs locally; they RUN in the image
 ```
 
-Python **3.10–3.12** (Airflow 3.3 and torch have no 3.13 wheels yet).
+Python **3.10–3.12** (Airflow 3.3 has no 3.13 wheels yet).
 
 ---
 
@@ -165,7 +154,7 @@ usually *far less fresh* than people assume.
 | **Cost** | lowest — one job, no idle server | low — pay per invocation | highest — always-on |
 | **Use when** | predictions are consumed from a table | reacting to events as they happen | a user is waiting for the answer |
 
-Sections 4–5 cover the *online* column. This section covers the other two.
+Section 4 covers the *online* column. This section covers the other two.
 
 ### 2.1 Batch scoring
 
@@ -200,15 +189,9 @@ bucket.blob(output_blob).upload_from_string(out_buffer.getvalue())
 #### Most important commands
 
 ```bash
-# Run the scoring job locally (needs GCP creds + the [gcp,tracking] extras)
-export GOOGLE_APPLICATION_CREDENTIALS=~/keys/sa.json
+# Run the scoring job locally (needs the [gcp,tracking] extras + object-store creds)
 export MLFLOW_TRACKING_URI=http://localhost:5000
 python src/batch_scoring.py
-
-# Inspect input/output in the bucket
-gsutil ls gs://mlops-gcs-ride-duration/scoring/input/
-gsutil ls gs://mlops-gcs-ride-duration/scoring/output/
-gsutil cp gs://mlops-gcs-ride-duration/scoring/output/$(date +%F).parquet .
 ```
 
 In production you don't run this by hand — you make it the last task of the
@@ -259,25 +242,19 @@ only a cold start pays the cost.
 - **Producer and consumer are decoupled.** The app publishes a ride event and moves on. If the model is down, messages queue in Pub/Sub instead of erroring out.
 - **Pub/Sub retries on failure** — a raised exception means the message is redelivered, not lost.
 
-#### Most important commands
+#### Testing the handler locally
+
+The handler is a plain function — you don't need a deployed topic to exercise it,
+just a base64-encoded payload shaped like a Pub/Sub event:
 
 ```bash
-# ── Create the topic (one time) ───────────────────────
-gcloud pubsub topics create ride-events
-
-# ── Deploy the function ───────────────────────────────
-gcloud functions deploy predict_on_pubsub \
-  --runtime python311 \
-  --trigger-topic ride-events \
-  --set-env-vars MODEL_URI=models:/RideDurationModel/Production
-
-# ── Publish a test event ──────────────────────────────
-gcloud pubsub topics publish ride-events \
-  --message='{"ride_id":"r-123","distance_km":8.4,"passengers":2,"hour_of_day":17}'
-
-# ── Watch the logs / read the predictions ─────────────
-gcloud functions logs read predict_on_pubsub --limit 20
-gcloud firestore documents list ride-predictions   # or read from the Console
+export MODEL_URI=models:/RideDurationModel/Production
+python -c '
+import base64, json, main_streaming_inference as m
+msg = {"ride_id":"r-123","distance_km":8.4,"passengers":2,"hour_of_day":17}
+event = {"data": base64.b64encode(json.dumps(msg).encode())}
+m.predict_on_pubsub(event, None)
+'
 ```
 
 ---
@@ -315,7 +292,7 @@ class MLAPIUser(HttpUser):
 - **Scenarios are plain Python.** Random payloads, weighted task mixes, auth flows, stateful sessions — anything you can write, you can simulate. No XML, no clicking through a GUI recorder.
 - **`catch_response` catches *semantic* failures.** A `200 OK` carrying a negative duration is a bug; Locust marks it as a failure. HTTP-only tools would report 100% success.
 - **Percentiles, not averages.** p95/p99 is what your users feel. The mean hides the tail.
-- **Finds the knee in the curve.** Ramp users up until p95 latency spikes — that's your real capacity, and now you can size the VM in section 6 with a number instead of a vibe.
+- **Finds the knee in the curve.** Ramp users up until p95 latency spikes — that's your real capacity, and now you can size the box you deploy on with a number instead of a vibe.
 - **`--headless --csv` makes it a CI gate.** Fail the build if p95 regresses.
 
 > **Note:** the scenario asserts `201`. FastAPI/BentoML return `200` by default,
@@ -359,362 +336,83 @@ right CUDA base image. **BentoML** generates all of it from a model reference
 and a Python function.
 
 [`bentoml_example.py`](bentoml_example.py) walks the full path: pull the
-Production model out of the MLflow registry, save it into BentoML's model store,
-wrap it in a Service, then package it as a Docker image.
+production model out of the MLflow registry, save it into BentoML's model store,
+wrap it in a Service, then package it as a Docker image. Each of the five things
+a serving framework buys you is marked `[1]`–`[5]` in the file.
 
 ```python
-bento_model = bentoml.sklearn.save_model(
-    "ride_duration", sk_model,
-    signatures={"predict": {"batchable": True, "batch_dim": 0}},   # ← adaptive batching
+@bentoml.service(
+    workers=1,                                    # [5] concurrency: process-level
+    traffic={"concurrency": 64, "timeout": 30},   # [5] admission + [2] queue bound
 )
+class RideDuration:
+    bento_model = bentoml.models.BentoModel(MODEL_TAG)   # [4] versioning
 
-runner = bentoml.sklearn.get("ride_duration:latest").to_runner()
-svc    = bentoml.Service("ride_api", runners=[runner])
+    def __init__(self) -> None:                          # runs once per worker
+        self.model = joblib.load(self.bento_model.path_of("model.pkl"))
 
-@svc.api(input=bentoml.io.JSON(pydantic_model=PredictRequest),
-         output=bentoml.io.JSON(pydantic_model=PredictResponse))
-async def predict(req: PredictRequest) -> PredictResponse:
-    result = await runner.predict.async_run(features)
-    return PredictResponse(duration_min=float(result[0]))
+    @bentoml.api(batchable=True, batch_dim=0,            # [1] dynamic batching
+                 max_batch_size=64, max_latency_ms=2_000)
+    def predict(self, inputs: list[PredictRequest]) -> list[PredictResponse]:
+        features = np.array([[r.distance_km, r.passengers] for r in inputs])  # [3] pre
+        preds = self.model.predict(features)             # ONE call for all N rows
+        return [PredictResponse(duration_min=round(float(p), 2), ...)         # [3] post
+                for p in preds]
 ```
 
 ### Why use it
 
-- **Adaptive batching for free.** `"batchable": True` makes BentoML collect concurrent requests into one `predict()` call. This is the single biggest throughput win available to an ML API, and it's one dict key. Re-run section 3's Locust test with it on and off — the difference is not subtle.
-- **Pydantic in, Pydantic out.** Malformed requests are rejected with a clean 422 before they ever touch the model.
-- **Runners scale independently of the API.** Model inference runs in its own worker process, so a slow prediction doesn't block the event loop serving `/health`.
+- **[1] Dynamic batching for free.** `batchable=True` makes BentoML merge concurrent requests into one `predict()` call — invisible to callers, who each send and receive a single row. This is the single biggest throughput win available to an ML API. Re-run section 3's Locust test with it on and off; the difference is not subtle.
+- **[2] Request queueing.** Traffic past `concurrency` waits instead of being refused, and `timeout` bounds that wait so an overloaded service sheds load rather than melting down.
+- **[3] Pydantic in, Pydantic out.** Malformed requests are rejected with a clean 4xx before they ever touch the model — and post-processing (rounding, derived fields) happens once, server-side, instead of in every client.
+- **[4] The model store is versioned.** Every save mints an immutable tag (`ride_duration:rlkriaedugl2xuiy`); rollback is redeploying a previous tag. Pin it in production — `:latest` means a colleague's save silently changes what you serve.
+- **[5] Concurrency control.** `workers` sets process-level parallelism, `traffic.concurrency` sets admission. Note the constraint: `concurrency` must be ≥ `max_batch_size`, or the dispatcher can never hold enough requests to fill a batch.
 - **`bentoml containerize` writes the Dockerfile.** Correct Python version, correct deps, correct model — no hand-maintained image.
-- **The model store is versioned.** Every `save_model` gets a tag (`ride_duration:abc123`); rollback is redeploying a previous tag.
 - **Batteries included:** OpenAPI docs at `/docs`, Prometheus metrics at `/metrics`, health checks — all out of the box.
 
-> **Version note:** [`pyproject.toml`](pyproject.toml) pins `bentoml>=1.1,<1.2`.
-> The script uses the legacy `bentoml.io` + `bentoml.Service(runners=[...])` API,
-> which BentoML 1.2 replaced with the `@bentoml.service` class-based API.
+> **Version note:** this targets the `@bentoml.service` class API (BentoML 1.2+,
+> tested on 1.4.39). The legacy `bentoml.io` + `bentoml.Service(runners=[...])`
+> API was **removed** in 1.2 — `to_runner()` and `bentoml.io` no longer exist.
+> Likewise, the model is loaded by MLflow *alias* (`models:/Name@production`),
+> since MLflow 3 removed the `Production`/`Staging` stages.
 
 ### Most important commands
 
 ```bash
 # ── Save the model into the BentoML store ─────────────
+export MLFLOW_TRACKING_URI=http://localhost:5000   # else falls back to models/rf_model.pkl
 python bentoml_example.py
 bentoml models list                      # see the tags
 bentoml models get ride_duration:latest
 
 # ── Dev server (hot reload) ───────────────────────────
-bentoml serve bentoml_example:svc --reload
-curl -X POST http://localhost:3000/predict \
+bentoml serve bentoml_example:RideDuration --port 8005 --reload
+
+# NOTE the wire format: a batchable API takes {"<param>": [ <one item> ]}
+curl -X POST http://localhost:8005/predict \
   -H "Content-Type: application/json" \
-  -d '{"distance_km": 8.4, "passengers": 2, "hour_of_day": 17}'
+  -d '{"inputs": [{"distance_km": 8.4, "passengers": 2}]}'
+# → [{"duration_min": 17.68, "eta_band": "10-20 min", "model_version": "...", "batch_size": 1}]
+
+curl -X POST http://localhost:8005/model_info -d '{}'   # [4] what's actually live?
+open http://localhost:8005/docs
 
 # ── Package & containerize ────────────────────────────
-bentoml build                            # → a versioned Bento
-bentoml list                             # list built Bentos
-bentoml containerize ride_api:latest     # → a Docker image
+bentoml build                                    # → a versioned Bento
+bentoml list                                     # list built Bentos
+bentoml containerize ride_duration_api:latest    # → a Docker image
 
-docker run -p 3000:3000 ride_api:latest  # ready for section 6
+docker run -p 3000:3000 ride_duration_api:latest # the same image you'd ship anywhere
 ```
-
----
-
-## 5. TorchServe
-
-### What it is
-
-The PyTorch-native serving path, maintained alongside PyTorch itself. Where
-BentoML is framework-agnostic, **TorchServe** is built around one assumption —
-your model is a `torch.nn.Module` — and gets to specialise hard on that:
-TorchScript compilation, GPU batching, multi-model hosting, and model versioning
-in one binary.
-
-[`torch_serve.py`](torch_serve.py) shows the four steps:
-
-**1. Export to TorchScript** — a serialized graph the server can load without your Python class:
-```python
-scripted = torch.jit.script(model)
-scripted.save("ride_duration.pt")
-```
-
-**2. Write a handler** — the only glue you own: JSON → tensor, tensor → JSON:
-```python
-class RideHandler(BaseHandler):
-    def preprocess(self, data):
-        rows  = [json.loads(d["body"]) for d in data]     # `data` is a BATCH
-        feats = [[r["distance_km"], r["passengers"], r["hour_of_day"]] for r in rows]
-        return torch.tensor(feats, dtype=torch.float32)
-
-    def postprocess(self, output):
-        return [{"duration_min": round(v.item(), 2)} for v in output.squeeze()]
-```
-Note the shape of `preprocess`: it receives a **list** of requests, not one.
-TorchServe batched them for you, and the handler is written to stay vectorised.
-
-**3–4. Archive and serve** — bundle weights + handler into one `.mar` file, then start the server.
-
-### Why use it
-
-- **TorchScript decouples serving from your source tree.** The `.pt` file carries the graph; the server doesn't need to import your model class.
-- **Server-side batching is built in** (`batch_size` / `max_batch_delay`) — same throughput win as BentoML's adaptive batching, tuned for GPU.
-- **The `.mar` is a single versioned deployable.** Weights, handler, and config in one artifact you can store in a registry.
-- **Multi-model, one server.** Register N models on one GPU and route by URL — you don't pay for a GPU per model.
-- **Management API at :8081** — register, scale workers, and unregister models at runtime, no restart.
-- **First-class GPU support**, plus a metrics endpoint on :8082.
-
-**Pick TorchServe over BentoML** when you're all-in on PyTorch, need GPU batching,
-or want to host several models on one box. **Pick BentoML** when you have
-scikit-learn/XGBoost/mixed frameworks or want the shortest path to a Docker image.
-
-### Most important commands
-
-```bash
-# ── 1. Export TorchScript ─────────────────────────────
-python torch_serve.py                    # → ride_duration.pt
-
-# ── 2. Package into a .mar archive ────────────────────
-torch-model-archiver \
-  --model-name ride_duration \
-  --version 1.0 \
-  --serialized-file ride_duration.pt \
-  --handler handler.py \
-  --export-path model_store/
-
-# ── 3. Start / stop the server ────────────────────────
-torchserve --start \
-  --model-store model_store/ \
-  --models ride_duration=ride_duration.mar \
-  --ts-config config.properties
-torchserve --stop
-
-# ── 4. Inference (:8080) ──────────────────────────────
-curl -X POST http://localhost:8080/predictions/ride_duration \
-  -H "Content-Type: application/json" \
-  -d '{"distance_km": 8.4, "passengers": 2, "hour_of_day": 17}'
-
-# ── Management API (:8081) — no restart needed ────────
-curl http://localhost:8081/models                                   # list
-curl -X POST "http://localhost:8081/models?url=ride_duration.mar"   # register
-curl -X PUT  "http://localhost:8081/models/ride_duration?min_worker=4"  # scale workers
-curl -X DELETE http://localhost:8081/models/ride_duration/1.0       # unregister
-
-# ── Metrics (:8082) ───────────────────────────────────
-curl http://localhost:8082/metrics
-```
-
----
-
-## 6. GCP & cloud basics
-
-### What it is
-
-Everything above ran on your laptop. This section is the last mile: **build the
-image, push it to a registry, and run it on a VM with a public IP** — the
-simplest deployment that a real user can actually reach.
-
-The flow is deliberately boring, and that's the point:
-
-```
-docker build → docker push → create VM → open firewall → SSH → docker pull → docker run
-```
-
-We do it **twice**: first by hand with `gcloud`, so you see every moving part;
-then with **Terraform** ([`infra/`](infra/)), which is what you'd actually keep.
-Do the manual pass first — Terraform is much easier to read once you know which
-command each resource is standing in for.
-
-### Why use it
-
-- **The container is the contract.** The image that passed Locust on your laptop is bit-for-bit the image running on the VM. "Works on my machine" stops being a sentence anyone says.
-- **A single VM is the right first step.** Understand a `docker run` on one box before you reach for Kubernetes, Cloud Run, or Vertex AI — those solve scaling problems you don't have yet.
-- **Redeploying is `pull` + `run`.** No build tooling on the server, no source code on the server.
-- **`--restart unless-stopped` gives you free resilience.** The container comes back after a crash *and* after a VM reboot.
-- **The firewall is deny-by-default.** Nothing is reachable until you open a port and tag the VM — a good default worth internalising early.
-- **Everything is a CLI call, so everything is scriptable** — which is exactly the observation Terraform is built on.
-
-### 6.1 The manual flow (`gcloud` CLI)
-
-```bash
-# ── On your local machine: push image to Docker Hub ──
-docker build -t yourusername/ride-api:latest .
-docker push yourusername/ride-api:latest
-
-# ── Create a GCP VM (one time, via gcloud CLI) ────────
-gcloud compute instances create ride-api-vm \
-  --machine-type=e2-small \
-  --image-family=ubuntu-2204-lts \
-  --image-project=ubuntu-os-cloud \
-  --tags=http-server \
-  --zone=us-central1-a
-
-# ── Open firewall port 8000 (one time) ────────────────
-gcloud compute firewall-rules create allow-8000 \
-  --allow tcp:8000 --target-tags http-server
-
-# ── SSH into the VM ───────────────────────────────────
-gcloud compute ssh ride-api-vm --zone=us-central1-a
-
-# ── On the VM: install Docker (one time) ──────────────
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER && newgrp docker
-
-# ── On the VM: deploy / redeploy ──────────────────────
-docker pull yourusername/ride-api:latest
-docker stop ride-api 2>/dev/null || true
-docker rm   ride-api 2>/dev/null || true
-docker run -d --name ride-api --restart unless-stopped \
-  -p 8000:8000 -e MODEL_PATH=/models/v1/model.pkl \
-  yourusername/ride-api:latest
-
-# ── Get public IP and verify ──────────────────────────
-gcloud compute instances describe ride-api-vm \
-  --zone=us-central1-a --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
-curl http://<EXTERNAL_IP>:8000/health
-```
-
-#### Reading the important flags
-
-| Flag | Why it's there |
-|---|---|
-| `--tags=http-server` | The label the firewall rule targets. No tag → no traffic, even with the rule created. |
-| `--target-tags http-server` | Binds the rule to *only* the VMs carrying that tag, not the whole network. |
-| `-d` | Detached — the container survives your SSH session ending. |
-| `--restart unless-stopped` | Restarts on crash and on VM reboot; still respects a deliberate `docker stop`. |
-| `-p 8000:8000` | Publishes the container port on the host. Without it the firewall rule opens a port nothing is listening on. |
-| `-e MODEL_PATH=...` | Config via environment — the same image serves any model version. |
-| `docker stop \|\| true` | First deploy has no container to stop; `\|\| true` keeps the script from failing on it. |
-
-#### Everyday `gcloud` commands
-
-```bash
-# ── Auth & project setup (one time) ───────────────────
-gcloud auth login
-gcloud config set project <PROJECT_ID>
-gcloud config set compute/zone us-central1-a
-
-# ── Inspect what's running ────────────────────────────
-gcloud compute instances list
-gcloud compute firewall-rules list
-gcloud compute ssh ride-api-vm --command='docker ps'
-gcloud compute ssh ride-api-vm --command='docker logs --tail 50 ride-api'
-
-# ── Stop paying for it ────────────────────────────────
-gcloud compute instances stop ride-api-vm      # keeps the disk, stops the bill for CPU
-gcloud compute instances delete ride-api-vm    # gone for good
-```
-
-> **Cost:** an `e2-small` running 24/7 is a few dollars a month — small, not free.
-> `gcloud compute instances stop` when you're done with the demo.
-
-#### Where the manual flow breaks down
-
-It works, and that's the trap. The problems only show up later:
-
-- **It exists nowhere but in your shell history.** Six months on, nobody knows whether that firewall rule was `8000` or `8080`, or why the VM is an `e2-small`.
-- **It isn't repeatable.** Building the staging environment means re-typing all of it and hoping you don't fluff a flag. The drift between environments is where the 2 a.m. bugs live.
-- **It has no idea what it already did.** Re-run `instances create` and it errors; you have to remember what exists.
-- **Tearing down is manual too** — and the resource you forget is the one that bills you.
-- **There's no review.** Nobody diffs a shell command before it opens a port to `0.0.0.0/0`.
-
-### 6.2 The same thing, with Terraform
-
-#### What it is
-
-**Terraform** is the same deployment written as *declared state* instead of
-typed commands. You describe what should exist; Terraform diffs that against
-what does exist and makes only the changes needed. [`infra/`](infra/) is a
-faithful port of the block above — plus the three things the manual flow quietly
-skipped.
-
-| Manual command | Terraform resource in [`infra/main.tf`](infra/main.tf) |
-|---|---|
-| `gcloud compute instances create` | `google_compute_instance.ride_api` |
-| `gcloud compute firewall-rules create allow-8000` | `google_compute_firewall.allow_app` |
-| SSH in, `curl get.docker.com \| sh`, `docker pull`, `docker run` | `metadata.startup-script` → [`infra/startup.sh`](infra/startup.sh) |
-| `gcloud compute instances describe ... --format='get(...natIP)'` | `output.external_ip` in [`infra/outputs.tf`](infra/outputs.tf) |
-| *(nothing — the IP was ephemeral)* | `google_compute_address.ride_api` — a **static** IP |
-| *(nothing — the VM used the default SA)* | `google_service_account.ride_api` — **least privilege** |
-| *(nothing — port 22 was public)* | `google_compute_firewall.allow_ssh_iap` — **SSH via IAP only** |
-
-Those last three rows are the real argument for IaC. They're all things you'd
-*intend* to do manually and never get around to; in Terraform they're four lines
-you write once.
-
-The whole deploy — install Docker, pull, run — moves into the VM's
-`startup-script` metadata, so it runs automatically on first boot. **You never SSH
-in to deploy.** The `templatefile()` call injects your image and port into it:
-
-```hcl
-metadata = {
-  startup-script = templatefile("${path.module}/startup.sh", {
-    docker_image   = var.docker_image
-    container_name = var.container_name
-    app_port       = var.app_port
-    model_path     = var.model_path
-  })
-}
-```
-
-#### Why use it
-
-- **The infrastructure is in code review.** `--allow tcp:8000 --source-ranges 0.0.0.0/0` slips through a shell. It does not slip through a pull request.
-- **`terraform plan` is a dry run.** You see *exactly* what will change — created, updated, or **destroyed** — before anything happens. There is no `gcloud` equivalent.
-- **Idempotent.** Run `apply` ten times; if nothing changed, nothing happens. Re-running the manual flow throws "already exists" errors.
-- **`terraform destroy` is complete.** It knows every resource it made, so the demo VM, its IP, its firewall rules and its service account all go together. Nothing lingers on the bill.
-- **A new environment is a new `.tfvars`.** Staging = the same code, a different variable file. That's how you kill environment drift.
-- **It's the documentation, and it can't go stale** — because it's also the thing that runs.
-- **State is shared.** Uncomment the GCS backend in [`versions.tf`](infra/versions.tf) and your teammate's `plan` sees what you deployed.
-
-#### Most important commands
-
-```bash
-cd infra
-cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars → set gcp_project and docker_image
-
-gcloud auth application-default login   # Terraform's credentials
-
-# ── The core loop ─────────────────────────────────────
-terraform init         # download the google provider (once, and after backend changes)
-terraform fmt          # canonical formatting
-terraform validate     # syntax + type check — no cloud calls, no credentials needed
-terraform plan         # DRY RUN: what would change? read this before every apply
-terraform apply        # make it so (prompts for confirmation)
-
-# ── Read the outputs ──────────────────────────────────
-terraform output                        # all of them
-terraform output -raw external_ip       # just the IP, for scripting
-curl "$(terraform output -raw api_url)/health"
-
-# ── Redeploy a new image version ──────────────────────
-terraform apply -var="docker_image=yourusername/ride-api:v2"
-
-# ── Inspect state ─────────────────────────────────────
-terraform state list                    # every resource Terraform manages
-terraform show                          # full current state
-
-# ── Tear it ALL down (VM + IP + firewall + SA) ───────
-terraform destroy
-```
-
-> **Always read the `plan` output.** The line that matters is the summary:
-> `Plan: 1 to add, 0 to change, 0 to destroy.` If **destroy** is non-zero and you
-> didn't expect it, stop — Terraform is about to replace something. That
-> confirmation prompt is the whole safety model.
-
-#### Gotchas worth knowing
-
-- **`terraform.tfvars` is gitignored** — it names your project and image. Commit [`terraform.tfvars.example`](infra/terraform.tfvars.example) instead.
-- **`*.tfstate` is gitignored too, and must stay that way.** It holds the full resource graph including anything sensitive. Use the GCS backend for anything shared.
-- **State is the source of truth.** If you `gcloud compute instances delete` a VM Terraform manages, Terraform still thinks it exists until the next `plan` reconciles it. Pick one tool per resource and stick with it.
-- **`allowed_source_ranges` defaults to `0.0.0.0/0`** — the entire internet, matching the manual flow. Narrow it to your own IP (`curl -s ifconfig.me`) the moment this serves a real model.
-- **`app_port` sets the firewall rule *and* the `docker run -p` in one place.** In the manual flow those were two commands that could silently disagree.
 
 ---
 
 ## Where this leaves you
 
-You now have all four deployment shapes for the same model, and the tools to
+You now have all three deployment shapes for the same model, and the tools to
 choose between them: **Airflow** schedules the retraining, **batch scoring**
 serves the cheap/high-throughput case, **streaming inference** serves the
-event-driven case, **BentoML/TorchServe** serve the online case, **Locust** tells
-you which of them will hold up, and **GCP + Terraform** put it in front of a real
-user — reproducibly.
+event-driven case, **BentoML** serves the online case, and **Locust** tells you
+which of them will hold up.
 
 The lesson worth keeping: the model was the easy part.

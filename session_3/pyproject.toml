@@ -1,7 +1,7 @@
 [project]
 name = "ride-duration-serving"
 version = "0.1.0"
-description = "Session 3 — deploy the ride-duration model: Airflow orchestration, batch scoring, streaming inference, and model serving (BentoML / TorchServe)."
+description = "Session 3 — deploy the ride-duration model: Airflow orchestration, batch scoring, streaming inference, and model serving (BentoML)."
 readme = "README.md"
 # Airflow 3.3 and torch do not ship wheels for 3.13+ yet; 3.12 is the ceiling
 # that every extra below can actually resolve on.
@@ -33,16 +33,10 @@ gcp = [
 # in BentoML 1.2 in favour of the `@bentoml.service` class-based API.
 # Install with: pip install -e ".[bentoml]"
 bentoml = [
-    "bentoml>=1.1,<1.2",
+    # 1.2 removed bentoml.io / Runners; bentoml_example.py uses the class API.
+    "bentoml>=1.2",
     "pydantic>=1.10",
     "ride-duration-serving[tracking]",  # loads the model out of the registry
-]
-# TorchServe (torch_serve.py). torch-model-archiver builds the .mar; the `ts`
-# package supplies BaseHandler. Install with: pip install -e ".[torch]"
-torch = [
-    "torch>=2.2",
-    "torchserve>=0.11",
-    "torch-model-archiver>=0.11",
 ]
 # Load testing (locustfile.py). Install with: pip install -e ".[load]"
 load = [
@@ -72,13 +66,10 @@ packages = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Root on sys.path so tests can import the top-level scripts (locustfile.py,
-# torch_serve.py, ...) that are not part of the installed `src` package.
+# bentoml_example.py, ...) that are not part of the installed `src` package.
 pythonpath = ["."]
 
 [tool.ruff.lint.per-file-ignores]
-# Walkthrough script: each "Step" section is a separate file in real use, so the
-# handler's imports deliberately sit mid-file rather than at the top.
-"torch_serve.py" = ["E402"]
 # DAG skeleton: task bodies are elided with `...`, so values pulled from XCom are
 # shown being fetched but not consumed.
 "Dags/example_1.py" = ["F841"]
