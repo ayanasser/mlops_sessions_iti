@@ -23,10 +23,10 @@ import httpx
 IMAGE = Path(__file__).parent / "assets" / "dog.jpg"
 
 
-async def one(client: httpx.AsyncClient, url: str, raw: bytes) -> float | None:
+async def one(client: httpx.AsyncClient, url: str, raw: bytes, field: str) -> float | None:
     t0 = time.perf_counter()
     try:
-        r = await client.post(url, files={"file": ("img.jpg", raw, "image/jpeg")})
+        r = await client.post(url, files={field: ("img.jpg", raw, "image/jpeg")})
         # A 503 is Level 2 shedding load on purpose (backpressure) -- it is a
         # successful rejection, not a crash, so it is excluded from latency.
         return (time.perf_counter() - t0) * 1000 if r.status_code == 200 else None
@@ -40,6 +40,11 @@ async def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("-c", "--concurrency", type=int, default=32)
     ap.add_argument("-n", "--requests", type=int, default=200)
+    # Levels 0-2 name the upload field "file"; the BentoML service in Level 4
+    # derives it from the parameter name, which is "images".
+    # Levels 0-2 name the upload field "file"; the BentoML service derives it
+    # from its parameter name, which is "images".
+    ap.add_argument("--field", default="file", help="multipart field name")
     args = ap.parse_args()
 
     url = f"http://{args.host}:{args.port}/predict"
@@ -48,11 +53,11 @@ async def main() -> None:
 
     limits = httpx.Limits(max_connections=args.concurrency + 8)
     async with httpx.AsyncClient(timeout=120.0, limits=limits) as client:
-        await client.post(url, files={"file": ("img.jpg", raw, "image/jpeg")})  # warm
+        await one(client, url, raw, args.field)                         # warm-up
 
         async def guarded() -> float | None:
             async with sem:
-                return await one(client, url, raw)
+                return await one(client, url, raw, args.field)
 
         print(f"{args.requests} requests, {args.concurrency} concurrent -> {url}")
         t0 = time.perf_counter()
