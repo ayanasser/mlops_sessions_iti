@@ -23,7 +23,7 @@ Run:    bentoml serve level_4_bentoml_service:ResNet50 --port 8004
 Then:   python bench.py --port 8004 -c 32 -n 200
 """
 
-import io
+
 
 import bentoml
 import numpy as np
@@ -82,11 +82,15 @@ class ResNet50:
         ]
 
     @bentoml.api(route="/predict")
-    async def predict(self, file: bytes) -> dict:
-        """Non-batchable entrypoint: decode one image, then hand off to the
-        batchable API above. Preprocessing still costs what Level 3 measured --
-        no framework makes JPEG decode free."""
-        img = Image.open(io.BytesIO(file)).convert("RGB")
-        tensor = _preprocess(img).numpy()
+    async def predict(self, file: Image.Image) -> dict:
+        """Single-image entrypoint. Annotating the param as PIL.Image is all it
+        takes for BentoML to accept a multipart upload and hand us a decoded
+        image -- no UploadFile, no io.BytesIO, no manual 400 on bad input.
+
+        It then hands off to the batchable API above, so concurrent callers
+        still get merged into one forward pass. Preprocessing still costs what
+        Level 3 measured: no framework makes JPEG decode free.
+        """
+        tensor = _preprocess(file.convert("RGB")).numpy()
         preds = await self.predict_batch.to_async([tensor])
         return {"version": self.bento_model.tag.version, "predictions": preds[0]}
