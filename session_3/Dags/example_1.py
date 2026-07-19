@@ -23,7 +23,7 @@ def extract(**ctx):
     from google.cloud import storage
 
     client = storage.Client()
-    bucket = client.bucket("mlops-gcs-ride-duration")
+    bucket = client.bucket("mlops-session2-iti")
     bucket.blob("rides/latest.parquet").download_to_filename("data/raw/rides.parquet")
 
 
@@ -33,7 +33,10 @@ def train(**ctx):
     import subprocess
 
     with mlflow.start_run() as run:
-        subprocess.run(["python", "src/train.py"], check=True)
+        # Run as a module, not a script path: train.py does `from src.config
+        # import ...`, which needs /opt/airflow (the cwd) on sys.path — running
+        # `python src/train.py` puts src/ there instead and the import fails.
+        subprocess.run(["python", "-m", "src.train"], check=True)
         ctx["ti"].xcom_push(key="run_id", value=run.info.run_id)
 
 

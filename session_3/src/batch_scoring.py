@@ -1,14 +1,25 @@
 # src/batch_score.py
-from google.cloud import storage
-import pandas as pd
-import mlflow.sklearn
-from datetime import date
 import io
+from datetime import date
+
+import mlflow
+import mlflow.sklearn
+import pandas as pd
+from google.cloud import storage
+
+from src.register_model import MODEL_NAME, PRODUCTION_ALIAS, TRACKING_URI
+from src.train import FEATURES
 
 
 def load_production_model():
-    """Always load from MLflow Production stage — no hardcoded paths."""
-    return mlflow.sklearn.load_model("models:/RideDurationModel/Production")
+    """Load the model carrying the ``@production`` alias — no hardcoded paths.
+
+    MLflow 3 removed the Production/Staging *stages*, so the old
+    ``models:/<name>/Production`` URI no longer resolves; aliases replace them.
+    Run ``python src/register_model.py`` to create the alias.
+    """
+    mlflow.set_tracking_uri(TRACKING_URI)
+    return mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@{PRODUCTION_ALIAS}")
 
 
 def batch_score(bucket_name: str, input_blob: str, output_blob: str) -> None:
@@ -22,8 +33,9 @@ def batch_score(bucket_name: str, input_blob: str, output_blob: str) -> None:
 
     # ── 2. Load model & score ──────────────────────────
     model = load_production_model()
-    features = df[["distance_km", "passengers", "hour_of_day"]].values
-    df["pred"] = model.predict(features)
+    # FEATURES is the single source of truth (src/train.py) — the model was fit
+    # on exactly these columns, so selecting them by hand risks a silent skew.
+    df["pred"] = model.predict(df[FEATURES].to_numpy())
     df["run_date"] = date.today().isoformat()
 
     # ── 3. Write predictions back to GCS ──────────────
@@ -35,7 +47,7 @@ def batch_score(bucket_name: str, input_blob: str, output_blob: str) -> None:
 
 if __name__ == "__main__":
     batch_score(
-        bucket_name="mlops-gcs-ride-duration",
+        bucket_name="mlops-session2-iti",
         input_blob=f"scoring/input/{date.today()}.parquet",
         output_blob=f"scoring/output/{date.today()}.parquet",
     )
