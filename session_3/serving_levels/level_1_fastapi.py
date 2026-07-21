@@ -21,21 +21,20 @@ Then: python bench.py --port 8001 -c 32 -n 200
 import io
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 
 import torch
 import torchvision.transforms as T
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
 from PIL import Image
+from pydantic import BaseModel
 from torchvision.models import ResNet50_Weights, resnet50
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_VERSION = "v1"          # problem 3: this is a constant. Changing it = redeploy.
 
 
-@dataclass
-class Metrics:
+class Metrics(BaseModel):
     requests: int = 0
     preprocess_s: float = 0.0
     forward_s: float = 0.0
@@ -135,3 +134,9 @@ async def metrics():
         f"preprocess_seconds_avg {m.preprocess_s / n:.5f}\n"
         f"forward_seconds_avg {m.forward_s / n:.5f}\n"
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8001)

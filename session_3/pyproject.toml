@@ -28,15 +28,21 @@ gcp = [
     "google-cloud-storage>=2.16",    # src/batch_scoring.py, Dags extract task
     "google-cloud-firestore>=2.16",  # main_streaming_inference.py prediction sink
 ]
-# BentoML serving (bentoml_example.py). Pinned <1.2 because the script uses the
-# legacy `bentoml.io` + `bentoml.Service(runners=[...])` API, which was removed
-# in BentoML 1.2 in favour of the `@bentoml.service` class-based API.
-# Install with: pip install -e ".[bentoml]"
+# BentoML serving (bentoml_example.py), written for the 1.2+ class-based
+# `@bentoml.service` API. Install with: pip install -e ".[bentoml]"
 bentoml = [
     # 1.2 removed bentoml.io / Runners; bentoml_example.py uses the class API.
     "bentoml>=1.2",
     "pydantic>=1.10",
     "ride-duration-serving[tracking]",  # loads the model out of the registry
+]
+# LLM serving with vLLM (serving_levels/level_5_vllm_llm.py).
+# vLLM publishes Linux-only wheels (needs CUDA for real use); on macOS the
+# marker skips it and you get just the `openai` client to call a remote server.
+# Install with: pip install -e ".[vllm]"
+vllm = [
+    "vllm>=0.10; platform_system == 'Linux'",
+    "openai>=1.30",   # the client half of the example works on any OS
 ]
 # Load testing (locustfile.py). Install with: pip install -e ".[load]"
 load = [

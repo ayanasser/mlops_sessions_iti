@@ -10,18 +10,19 @@ class MLAPIUser(HttpUser):
 
     @task(weight=10)  # 10x more common than /health
     def predict(self):
+        # Field names/types come from the served API's own contract:
+        # http://localhost:8000/openapi.json -> PredictRequest {distance, passengers}
         payload = {
-            "distance_km": round(random.uniform(0.5, 30.0), 2),
+            "distance": round(random.uniform(0.5, 30.0), 2),
             "passengers": random.randint(1, 4),
-            "hour_of_day": random.randint(0, 23),
         }
         with self.client.post(
             "/predict",
             json=payload,
             catch_response=True,
         ) as resp:
-            if resp.status_code != 201:
-                resp.failure(f"Expected 201, got {resp.status_code}")
+            if resp.status_code != 200:
+                resp.failure(f"Expected 200, got {resp.status_code}")
             elif resp.json().get("duration_min", -1) < 0:
                 resp.failure("Negative duration in response")
 

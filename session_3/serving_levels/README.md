@@ -35,6 +35,7 @@ architecture and nothing else. Run them top to bottom.
 | 3 | Runtime optimization (compile / ONNX / INT8) | `level_3_optimize.py` | — | yes |
 | 4 | BentoML | `level_4_save_model.py` → `level_4_bentoml_service.py` | 8004 | yes |
 | 4 | Triton (NVIDIA Dynamo-Triton) | `level_4_triton_export.py` → `level_4_triton/` | 8000 | export yes, serve needs amd64 |
+| 5 | vLLM (LLM-only) | `level_5_vllm_llm.py` | 8000 | client yes, serve needs Linux + GPU |
 
 Plus `bench.py`, the concurrent load generator used for every measurement below.
 
@@ -179,6 +180,108 @@ runtime, hard dependency limits, or you must understand it before you buy it).
 python level_3_optimize.py          # --quick skips the INT8 build
 ```
 
+## What "eager mode" means
+
+When you write normal PyTorch code:
+
+```python
+model = torchvision.models.resnet50()
+output = model(img)
+```
+
+PyTorch runs each operation one at a time, immediately, in Python order. That's
+called **eager mode** — it's eager to execute each line the moment it sees it.
+
+Think of it like a chef who cooks each ingredient one step at a time, waiting for
+each step to finish before starting the next, without ever looking at the full
+recipe.
+
+### The three problems with eager mode
+
+**Problem 1 — No graph fusion.** ResNet-50 has a pattern that repeats hundreds of
+times: `Conv2D → BatchNorm → ReLU`. In eager mode these are 3 separate GPU kernel
+launches:
+
+```
+launch Conv2D kernel    → wait → result
+launch BatchNorm kernel → wait → result
+launch ReLU kernel      → wait → result
+```
+
+Each kernel launch has overhead — the GPU has to stop, receive new instructions,
+and start again. TensorRT looks at the full model graph and fuses all three into a
+single kernel:
+
+```
+launch Conv+BN+ReLU kernel → single result
+```
+
+Same math, one launch instead of three. Across a full ResNet-50, this happens for
+every block.
+
+**Problem 2 — No memory planning.** In eager mode, PyTorch allocates GPU memory
+for each operation's output as it goes, without knowing what's coming next:
+
+```
+Op 1 runs → allocate memory for result
+Op 2 runs → allocate memory for result
+Op 1's memory freed (maybe)
+Op 3 runs → allocate memory for result
+...
+```
+
+This causes memory fragmentation and unnecessary allocations. A compiled graph
+knows the entire execution plan upfront, so it can pre-allocate a single memory
+workspace and reuse it efficiently throughout.
+
+**Problem 3 — Python interpreter overhead.** Every operation in eager mode goes
+through the Python interpreter:
+
+```
+Python sees model(img)
+→ Python calls forward()
+→ Python iterates through layers
+→ Python calls each layer
+→ Python calls each operation
+→ finally reaches GPU
+```
+
+That Python overhead — function calls, attribute lookups, type checks — adds up
+across hundreds of operations in a deep network.
+
+### What happens when you compile it
+
+When you export to ONNX and then to TensorRT (illustrative GPU numbers, **not
+measured on this machine** — see the measured CPU table below):
+
+```python
+# PyTorch eager — 3 steps per block, Python overhead, no planning
+output = model(img)        # ~180ms
+
+# TensorRT compiled engine — fused kernels, pre-planned memory, no Python
+output = engine.run(img)   # ~18ms
+```
+
+TensorRT converts your model into an optimized execution plan specific to your
+GPU. It knows which kernels to fuse, how to lay out memory, and what order to run
+operations in for maximum parallelism. Python is out of the loop entirely during
+inference.
+
+### The chef analogy completed
+
+- **Eager PyTorch** = chef reads one recipe line, cooks it, reads the next line,
+  cooks it — never seeing the full picture
+- **TensorRT** = chef reads the entire recipe first, realizes steps 3+4+5 can
+  happen simultaneously in the same pan, plans the whole meal, then executes with
+  zero wasted time
+
+> **One-line summary:** Eager PyTorch is slow because it executes operations one
+> by one through Python with no knowledge of what comes next. A compiled engine
+> (TensorRT, ONNX Runtime) sees the whole graph, fuses operations, plans memory,
+> and runs entirely on the GPU — no Python involved.
+
+## The three levers
+
 Three independent levers, **multiplicative** with Level 2's batching win:
 
 | Lever | What it does | Typical gain | Accuracy cost |
@@ -255,6 +358,37 @@ python bench.py --port 8004 --field images -c 16 -n 60
 | write your own Dockerfile | `bentoml build && bentoml containerize` |
 | `UploadFile` + `io.BytesIO` + try/except | annotate the param `PIL.Image` |
 
+### The `@bentoml.api` decorator, decoded
+
+```python
+@bentoml.api(
+    batchable=True,
+    batch_dim=0,
+    max_batch_size=MAX_BATCH,
+    max_latency_ms=10_000,
+)
+def predict(self, images: list[Image.Image]) -> list[dict]:
+```
+
+- **`batchable=True`** — "You're allowed to group requests." Without it, every HTTP
+  request = one call to `predict` with one image. With it, BentoML holds incoming
+  requests in a queue for a few milliseconds, and if 5 requests arrive around the
+  same time, it calls `predict` once with a list of 5 images.
+- **`batch_dim=0`** — "Group them along dimension 0, and split the answer the same
+  way." Dimension 0 of a list is just its positions. So if clients A, B, C get
+  merged, `predict` receives `[img_A, img_B, img_C]`, and BentoML takes your
+  returned list and sends element 0 back to A, element 1 to B, element 2 to C. This
+  is the bookkeeping that guarantees nobody gets someone else's prediction.
+- **`max_batch_size=MAX_BATCH`** — "Never group more than 8 (CPU) / 32 (GPU) at
+  once." A cap, because a giant batch takes too long and can exhaust memory. On this
+  CPU, batch 8 is the sweet spot — Level 3 measured that batch 32 on CPU is actually
+  *slower* per image.
+- **`max_latency_ms=10_000`** — "No request may take more than 10 seconds total."
+  This is a deadline, not a wait-time. BentoML times your real batches, tunes the
+  collection window automatically, and if the queue gets so long that a new request
+  can't possibly finish within 10 s, it rejects it immediately with a 503 instead of
+  letting it rot in the queue.
+
 **Measured: 39.7 req/s, p50 390 ms, p99 468 ms, 60/60 successful.**
 
 ### Two things worth being honest about
@@ -278,12 +412,109 @@ hit while building this, both are commented in the source:
   requests are rejected before enough accumulate to fill a batch, and you have paid for
   a batching system that never batches.
 
+### The `traffic` line, decoded
+
+```python
+traffic={"timeout": 60, "concurrency": 64},
+```
+
+- **`"timeout": 60`** — a request that hasn't completed within 60 seconds is aborted
+  and the client gets an error. It covers the whole journey: waiting in the queue,
+  sitting in the batching window, plus the forward pass itself. Generous here because
+  a CPU forward pass on a full batch of 8 takes ~100 ms, but under 16 concurrent
+  clients a request can queue behind several batches.
+- **`"concurrency": 64`** — the maximum number of requests the service will hold in
+  flight simultaneously. Request number 65 is rejected immediately with a 503
+  "process is overloaded" rather than being queued forever. It's the framework
+  version of Level 2's hand-written `QUEUE_MAXSIZE` backpressure — the same 503, one
+  config key instead of code.
+
 You declare the deadline; the framework picks the window. That is the real shift in
 thinking at Level 4 — and it is why the batchable API must **be** the HTTP endpoint:
 batching is applied at request dispatch, so calling a batchable method internally from
 another handler gets you no batching at all.
 
----# Level 4 — Triton (the same ResNet-50, as configuration)
+### BentoML commands cheat-sheet
+
+Everything lives in a local store under `~/bentoml/` (`models/` for weights,
+`bentos/` for built bundles). The commands used in this level, plus the ones you
+will reach for next:
+
+```bash
+# --- model store (versioning) -------------------------------------------------
+python level_4_save_model.py            # saves resnet50 into the store -> a new tag
+bentoml models list                     # every model + every version (tag = name:hash)
+bentoml models get resnet50:latest      # metadata of one version: files, size, labels
+bentoml models delete resnet50:<tag>    # remove one version (-y to skip the prompt)
+
+# --- serving ------------------------------------------------------------------
+bentoml serve level_4_bentoml_service:ResNet50 --port 8004   # dev server, from this dir
+# --reload  = restart on code change; --debug = verbose logs
+
+# --- packaging (the part Level 2 cannot do) -----------------------------------
+bentoml build                           # bundle code + model tag into a Bento
+bentoml list                            # every built Bento in the store
+bentoml containerize resnet50_classifier:latest   # Bento -> docker image, no Dockerfile
+bentoml delete resnet50_classifier:<tag>          # remove a built Bento
+```
+
+The `tag` is the versioning story from the comparison table: `resnet50:latest`
+resolves to a concrete content hash at startup, so pinning a service to
+`resnet50:<hash>` *is* the rollback/canary mechanism — `bentoml models list` shows
+what `latest` currently points to.
+
+### Bentos vs "just write a Dockerfile"
+
+`bentoml containerize` is **not a replacement for Docker** — it produces a Docker
+image, by generating the Dockerfile and running `docker build` for you. The thing
+worth understanding is the artifact in between: the **Bento**.
+
+A Bento is a frozen, versioned snapshot of everything the service needs, taken at
+`bentoml build` time: the service code, the **exact model version** (`resnet50:latest`
+resolved to a concrete content hash, weights copied in), the locked Python
+dependencies, and build metadata. The tag names an immutable artifact — the ML
+equivalent of a `.jar` or a wheel. A Dockerfile is the "how to build"; a Bento is
+the "what to ship".
+
+**The advantage over a hand-written Dockerfile is the model.** Write your own and
+this line is doing a lot of unexamined work:
+
+```dockerfile
+COPY model.pt /app/model.pt     # ...which model.pt? trained when? by whom?
+```
+
+You now own: where weights live, which version is inside this image, how to roll
+back to the previous weights, and how to guarantee that the code and the weights
+that were validated *together* ship *together*. That is Level 1's "problem 3: no
+model versioning" again — the Dockerfile does not solve it, it just moves it inside
+an image. A Bento binds code + model version **by hash at build time**: rollback is
+redeploying yesterday's tag, a canary is two Bentos side by side, and `bentoml list`
+is your release history.
+
+The generated Dockerfile is also not trivial to hand-maintain — base image, pinned
+deps, model store layout, server entrypoint, health and metrics endpoints. Same
+trade as everywhere else in Level 4: Level 2 hand-wrote the batcher; a hand-rolled
+Dockerfile + weight-fetching script is the same story one layer up.
+
+**When a plain Dockerfile is the better choice:** the service is more app than
+model (heavy business logic, multiple processes, unusual system deps); your team
+already has mature image conventions everything must follow; or you are not serving
+with BentoML anyway — a Bento only knows how to run a BentoML service. It is also
+not either/or: `bentofile.yaml` takes a `docker:` section (`base_image`,
+`system_packages`, CUDA variants), so Docker-level control stays available.
+
+> **Docker answers "how do I run this anywhere?" A Bento answers "which code +
+> which model + which deps, exactly?"** — then `containerize` hands that answer to
+> Docker.
+
+Platform note for this machine: images default to `linux/amd64` (the
+`Locking packages for x86_64-manylinux` line during `build`), so on Apple Silicon
+pass `--platform linux/arm64` to `bentoml containerize` to run the container
+locally — the same architecture caveat as Triton below.
+
+---
+
+# Level 4 — Triton (the same ResNet-50, as configuration)
 
 ```bash
 python level_4_triton_export.py     # ONNX export, verified against PyTorch
@@ -364,6 +595,107 @@ several models under a latency SLA, Triton is what the trade was designed for.
 
 ---
 
+# Level 5 — vLLM (serving an LLM)
+
+Everything above serves a model where every request costs the same compute. An LLM
+does not: each request generates a different number of tokens, so vLLM replaces the
+fixed-batch scheduler with **continuous batching** (requests join and leave the
+running batch every decode step) and **PagedAttention** (KV-cache stored in pages,
+like virtual memory, so long and short sequences share GPU memory without waste).
+You do not configure either — they are the defaults.
+
+Example: [`level_5_vllm_llm.py`](level_5_vllm_llm.py).
+
+## Installation
+
+```bash
+# Linux + NVIDIA GPU (the supported path — wheels are Linux-only)
+pip install vllm
+# or via this repo's extra (also brings the openai client):
+pip install -e ".[vllm]"
+
+# specific CUDA builds / nightly:
+pip install vllm --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+**This machine (Apple Silicon):** there is no macOS wheel —
+`pip install vllm` builds from source and only produces the experimental CPU
+backend, which is unusable for a 7B model in practice. Same honesty as the Triton
+level: run vLLM on a Linux GPU box (cloud VM, Colab, a departmental server) and
+call it from here. The `.[vllm]` extra installs `vllm` only on Linux via an
+environment marker; on macOS it installs just the `openai` client, which is all
+the example needs to talk to a remote server.
+
+## Serve
+
+```bash
+# One command — model is pulled from the HuggingFace Hub on first run
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 1 \      # number of GPUs to shard the model across
+  --max-model-len 8192            # max context window (prompt + generation)
+
+# Flags you will actually reach for:
+#   --gpu-memory-utilization 0.9   fraction of VRAM vLLM may claim (default 0.9)
+#   --dtype float16|bfloat16       precision (default: model config)
+#   --quantization awq|gptq|fp8    run a quantized checkpoint
+#   --api-key <key>                require Authorization: Bearer <key>
+#   --served-model-name my-model   alias clients use instead of the HF path
+```
+
+The server speaks the **OpenAI API**. That is the deployment story: any client,
+SDK, or framework that talks to OpenAI works unchanged by swapping `base_url`.
+
+## Call it
+
+```bash
+# raw HTTP
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "messages": [{"role": "user", "content": "One sentence on PagedAttention."}],
+        "max_tokens": 256
+      }'
+
+curl http://localhost:8000/v1/models        # what is being served
+curl http://localhost:8000/metrics          # Prometheus, free — same as Levels 4
+```
+
+```python
+# or the openai client — zero code change vs the real OpenAI API
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="Qwen/Qwen2.5-7B-Instruct",
+    messages=[{"role": "user", "content": "Write a haiku about MLOps."}],
+    stream=True,                            # tokens as they generate
+)
+```
+
+## Offline / batch use — no server at all
+
+```python
+from vllm import LLM, SamplingParams
+llm = LLM(model="Qwen/Qwen2.5-7B-Instruct", dtype="float16")
+out = llm.generate(["prompt 1", "prompt 2", ...], SamplingParams(max_tokens=512))
+```
+
+Pass **all prompts in one call** — vLLM schedules them together. Looping one
+prompt at a time is the LLM version of Level 1's batch-size-1 mistake.
+
+## Commands cheat-sheet
+
+```bash
+vllm serve <model> --port 8000            # start the OpenAI-compatible server
+vllm serve <model> --tensor-parallel-size 4    # shard across 4 GPUs
+vllm bench serve --model <model>          # built-in load generator (their bench.py)
+curl localhost:8000/health                # liveness probe for k8s
+curl localhost:8000/metrics | grep vllm:  # running/waiting requests, KV-cache usage
+```
+
+---
+
 # Every serving approach: what it buys, and when to use it
 
 | Approach | Key benefit | Main cost | Use when |
@@ -376,7 +708,7 @@ several models under a latency SLA, Triton is what the trade was designed for.
 | **TorchServe** | PyTorch-native, `.mar` archives, management API | **maintenance mode** — a stepping stone, not a destination | existing TorchServe estate only |
 | **BentoML** | Python-native; batching, versioning, Prometheus, containerization included; multi-model composition | some throughput overhead; framework opinions | most Python teams shipping one or a few models — **the default recommendation** |
 | **Triton / NVIDIA Dynamo-Triton** | C++, no GIL; many backends in one process; ensembles; concurrent execution; hot reload | conversion step, `config.pbtxt`, heavy runtime | GPU fleets, multiple models, strict latency SLAs |
-| **vLLM / TGI (LLM-specific)** | continuous batching + PagedAttention for autoregressive decode | LLM-only | serving an LLM — see `../serve_llm_vllm_example.py` |
+| **vLLM / TGI (LLM-specific)** | continuous batching + PagedAttention for autoregressive decode | LLM-only | serving an LLM — see `level_5_vllm_llm.py` |
 | **Serverless (Cloud Run / Functions)** | scale to zero, no servers to run | cold starts, no GPU batching, time limits | spiky or low traffic; event-driven scoring |
 | **Nginx / gateway canary** | traffic splitting, A/B, gradual rollout | another component to operate | validating v2 against v1 — see `../nginx.conf`, `../ab_testing.py` |
 

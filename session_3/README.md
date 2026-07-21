@@ -11,7 +11,7 @@ The model itself is unchanged — the same synthetic **ride-duration** regressor
 **This README follows the order you'd actually build the stack:**
 
 1. [Orchestration with Airflow](#1-orchestration-with-airflow) — schedule and retry the retraining pipeline
-2. [Deployment strategies](#2-deployment-strategies) — [batch scoring](#21-batch-scoring) vs. [streaming inference](#22-streaming-inference)
+2. [Deployment strategies](#2-deployment-strategies) — [batch scoring](#21-batch-scoring) vs. [streaming inference](#22-streaming-inference), plus [release strategies](#23-release-strategies--roll-out-without-breaking-users) (blue/green, canary, A/B, shadow) and [Nginx](#24-nginx--the-traffic-layer-that-makes-23-possible), the traffic layer that implements them
 3. [Load testing with Locust](#3-load-testing-with-locust) — find the breaking point before users do
 4. [BentoML serving](#4-bentoml-serving) — model → production API → Docker image
 
@@ -257,6 +257,121 @@ m.predict_on_pubsub(event, None)
 '
 ```
 
+### 2.3 Release strategies — roll out without breaking users
+
+A new model that passes all tests can still fail in production: the offline eval
+set is not live traffic. These four patterns make the rollout itself safe and
+measurable. They answer a different question than 2.1/2.2 — not *how is the model
+served*, but *how does version N+1 replace version N*.
+
+#### Blue / Green — instant switch
+
+Run two identical environments. Route 100% of traffic to **Blue** (current).
+Deploy the new model to **Green**, test it there, then flip the load balancer.
+Used by Netflix and most SaaS B2B products for zero-downtime deploys.
+
+| ✓ Pros | ✗ Cons |
+|---|---|
+| Instant rollback — flip back to Blue | Costs 2× infra while both envs run |
+| Zero downtime during the switch | The flip is all-or-nothing: 100% of users hit the new model at once |
+| Green can be tested against production infra before any user sees it | A bug that only shows under full traffic still reaches everyone |
+
+#### Canary release — gradual rollout
+
+Route a small slice (say 5%) of real traffic to the new model. Watch MAE and
+error rate. If healthy, widen: 5% → 20% → 50% → 100%. If metrics degrade,
+auto-roll back. Amazon runs hundreds of canary deploys simultaneously — a model
+degrading add-to-cart by more than 0.01% is rolled back automatically within
+15 minutes.
+
+| ✓ Pros | ✗ Cons |
+|---|---|
+| Real traffic validates the model gradually — blast radius starts at 5% | Needs traffic splitting + monitoring infrastructure |
+| Rollback affects only the canary slice | Small slices need time to accumulate statistical signal |
+| Automatable: metric threshold → auto-rollback, no human in the loop | Two model versions live at once — feature pipelines must support both |
+
+#### A/B testing — experiment
+
+Split **users** (not requests) by segment: model A serves group A, model B serves
+group B, for days or weeks. Measure business metrics — CTR, revenue, retention —
+not model metrics like MAE. Booking.com runs 1000+ A/B tests at once; ranking
+model improvements are validated by booking conversion, not NDCG.
+
+| ✓ Pros | ✗ Cons |
+|---|---|
+| Proves actual business value, not proxy-metric improvement | Needs many users and a long run time for significance |
+| Consistent per-user experience (sticky assignment, unlike a canary) | An experimentation platform is real infrastructure to build/buy |
+| Can conclude "better offline metrics ≠ better business outcome" — the finding that matters | Both variants must stay deployed for the whole experiment |
+
+#### Shadow mode — zero-risk eval
+
+The new model receives a copy of **every** request in parallel, but its
+predictions are logged and **never returned to users**. Compare shadow vs
+production offline. Meta runs shadow mode before every major Feed-ranking swap —
+48 hours of logged comparison before any traffic shifts.
+
+| ✓ Pros | ✗ Cons |
+|---|---|
+| Absolutely zero risk to users | Doesn't measure user impact — nobody ever saw the predictions |
+| Full production traffic distribution, not a sample | Double compute on every request |
+| Catches serving-time failures (latency spikes, schema drift, crashes) before launch | Useless for models whose value depends on user reaction (ranking, recommendations) |
+
+#### Picking one
+
+They compose rather than compete — a common production sequence is:
+
+1. **Shadow** the new model until it is stable on real traffic (catches crashes and latency, risk-free).
+2. **Canary** it at 5% → 100% (catches degradation on live outcomes, small blast radius).
+3. **A/B test** only when the question is *business* value, not model health.
+4. **Blue/Green** is the mechanics of the final swap — and your instant-rollback lever.
+
+Rule of thumb: shadow answers *"does it run?"*, canary answers *"does it behave?"*,
+A/B answers *"does it pay?"*.
+
+### 2.4 Nginx — the traffic layer that makes 2.3 possible
+
+**Nginx** is a high-performance, event-driven server that sits *in front of* your
+model API. It is not part of the model stack at all — it is the general-purpose
+traffic layer the release strategies above are built on. One process, four jobs:
+
+- **Web server** — serves static files (HTML, images, CSS) very efficiently,
+  thousands of concurrent connections per worker without a thread per client.
+- **Reverse proxy** — sits in front of application servers (uvicorn, BentoML,
+  Triton) and forwards requests to them; clients only ever see Nginx.
+- **Load balancer** — distributes traffic across multiple backend servers:
+  round-robin by default, weighted, least-connections, or IP-hash for stickiness.
+- **API gateway / TLS termination** — handles HTTPS, rate limiting, and routing,
+  so your Python server speaks plain HTTP on localhost and never touches
+  certificates or abuse traffic.
+
+Why it matters for this session: **the weighted load balancer *is* the canary and
+blue/green mechanism.** The whole of 2.3 reduces to one `upstream` block:
+
+```nginx
+upstream ride_api {
+    server 127.0.0.1:8000 weight=95;   # blue  — model v1
+    server 127.0.0.1:8005 weight=5;    # green — model v2, the 5% canary
+}
+
+server {
+    listen 443 ssl;                     # TLS terminated here, not in Python
+    location /predict {
+        proxy_pass http://ride_api;     # reverse proxy to whichever upstream wins
+    }
+    location /static/ {
+        root /var/www;                  # web server: files served directly
+    }
+}
+```
+
+- Canary 5% → 20%: change `weight=5` to `weight=20`, `nginx -s reload` (zero
+  downtime — old workers finish their requests, new workers get the new config).
+- Blue/green flip: swap which server carries the weight, same reload.
+- Instant rollback: swap it back.
+
+The model servers never know any of this is happening — which is exactly the
+point. Traffic policy lives in the traffic layer, not in your Python code.
+
 ---
 
 ## 3. Load testing with Locust
@@ -279,10 +394,10 @@ class MLAPIUser(HttpUser):
 
     @task(weight=10)                    # 10x more common than /health
     def predict(self):
-        payload = {"distance_km": ..., "passengers": ..., "hour_of_day": ...}
+        payload = {"distance": ..., "passengers": ...}   # the API's own schema
         with self.client.post("/predict", json=payload, catch_response=True) as resp:
-            if resp.status_code != 201:
-                resp.failure(f"Expected 201, got {resp.status_code}")
+            if resp.status_code != 200:
+                resp.failure(f"Expected 200, got {resp.status_code}")
             elif resp.json().get("duration_min", -1) < 0:
                 resp.failure("Negative duration in response")   # a 200 that's still wrong
 ```
@@ -295,30 +410,68 @@ class MLAPIUser(HttpUser):
 - **Finds the knee in the curve.** Ramp users up until p95 latency spikes — that's your real capacity, and now you can size the box you deploy on with a number instead of a vibe.
 - **`--headless --csv` makes it a CI gate.** Fail the build if p95 regresses.
 
-> **Note:** the scenario asserts `201`. FastAPI/BentoML return `200` by default,
-> so point this at an endpoint that really returns `201` — or change the check to
-> `!= 200`.
+> **Note:** the payload and expected status are pinned to the target's contract —
+> check `http://<host>/openapi.json` first. Getting this wrong shows up as 100%
+> failures with `422` (schema mismatch) or a wrong-status error, not as a crash.
 
-### Most important commands
+### Locust commands cheat-sheet
+
+All commands run from this directory with the session venv
+(`.venv/bin/locust`, or just `locust` with the venv activated).
 
 ```bash
+# ── Sanity checks ─────────────────────────────────────
+locust --version                    # confirm the install (2.45.0 here)
+locust -f locustfile.py --list      # list the user classes/tasks without running
+
 # ── Interactive: web UI at http://localhost:8089 ──────
 locust -f locustfile.py --host http://localhost:8000
+# pick users + spawn rate in the browser; charts update live
+locust -f locustfile.py --host http://localhost:8000 --web-port 8090
+# ...if 8089 is already taken
 
-# ── Headless: scripted run, results to CSV ────────────
+# ── Headless: scripted run, no UI ─────────────────────
 locust -f locustfile.py --host http://localhost:8000 \
   --users 100 \          # total concurrent users
   --spawn-rate 10 \      # add 10 users/sec until 100
   --run-time 2m \        # then stop
-  --headless \
-  --csv=results/load_test
+  --headless
+
+# ── Results to files ──────────────────────────────────
+locust -f locustfile.py --host http://localhost:8000 \
+  --users 100 --spawn-rate 10 --run-time 2m --headless \
+  --csv=results/load_test \        # 4 CSVs: stats, history, failures, exceptions
+  --csv-full-history \             # keep every interval row, not just the last
+  --html=results/load_test.html    # self-contained report with the charts
 
 # ── CI gate: fail the build on regressions ────────────
 locust -f locustfile.py --host http://localhost:8000 \
   --users 200 --spawn-rate 20 --run-time 3m --headless \
-  --only-summary \
-  --exit-code-on-error 1
+  --only-summary \                 # skip the per-interval console spam
+  --exit-code-on-error 1           # non-zero exit if any request failed
+
+# ── Useful knobs ──────────────────────────────────────
+#   --stop-timeout 10s      let in-flight requests finish on shutdown
+#   --autostart             web UI, but start the run immediately
+#   --autoquit 5            exit 5s after the run finishes (pairs with --autostart)
+#   --loglevel DEBUG        see every request/response while debugging a scenario
+#   --config locust.conf    put any of these flags in a file instead
+
+# ── Scale the load generator itself ───────────────────
+# One Python process ≈ one core. When the *generator* is the bottleneck
+# (CPU pegged, RPS plateaus while the server is idle), fan out:
+locust -f locustfile.py --processes 4          # 4 local workers, one master
+locust -f locustfile.py --processes -1         # one worker per core
+# ...or across machines:
+locust -f locustfile.py --master               # on the coordinator box
+locust -f locustfile.py --worker --master-host <ip>   # on each generator box
 ```
+
+**Ports in this repo:** the scenario targets the Dockerized Ride Duration API on
+`8000` (`/predict` takes `{"distance", "passengers"}`, returns 200). The other
+servers — `8001` level-1 FastAPI, `8002` level-2 batching, `8004` BentoML ResNet,
+`8005` BentoML ride-duration — speak different request shapes, so adapt the
+payload before pointing `--host` at them.
 
 Read the summary right to left: **failure count first** (any non-zero means stop
 tuning and start fixing), then **p95/p99**, then RPS. A high RPS with a 12-second
@@ -327,6 +480,75 @@ p99 is not a passing test.
 ---
 
 ## 4. BentoML serving
+
+### Why `async def` alone doesn't save you: the GIL
+
+#### The setup
+
+When you write a FastAPI endpoint like this:
+
+```python
+@app.post("/predict")
+async def predict(file: UploadFile):
+    img = preprocess(await file.read())
+    logits = model(img)   # ← this is the problem
+    return {"class": int(logits.argmax())}
+```
+
+The `async def` makes it look non-blocking. But `model(img)` — the actual
+PyTorch forward pass — is not async. It's a regular blocking call.
+
+#### What the GIL is
+
+Python has a rule called the **Global Interpreter Lock (GIL)**. It says: only
+one thread can execute Python code at a time.
+
+This means when `model(img)` starts running — which might take 80ms — it holds
+the GIL. No other code in Python can run during those 80ms. Not even the event
+loop that's supposed to be listening for new incoming requests.
+
+#### What happens with 100 concurrent users
+
+```
+User 1   → request arrives → model(img) starts → 80ms blocked
+User 2   → request arrives → has to WAIT (GIL held)
+User 3   → request arrives → has to WAIT
+...
+User 100 → request arrives → has to WAIT for all 99 before it
+```
+
+So instead of 100 users getting served in parallel in 80ms each, they queue up.
+User 100 waits 100 × 80ms = 8 seconds before their request even starts. That's
+why the benchmark shows 4,200ms p95 at 100 users even though one user gets 85ms.
+
+#### What BentoML Runner fixes
+
+BentoML moves the model into a completely separate Python **process** — not a
+thread, a full process. A separate process has its own GIL. So:
+
+```
+HTTP server process          Model Runner process
+(handles all requests)       (owns the model)
+        │                           │
+User 1 arrives ──────────── async call ──→ model(img) runs here
+User 2 arrives ──────────── async call ──→ queued by runner
+        │                           │
+HTTP server never blocks    Model runs independently
+```
+
+The HTTP server's event loop is free to accept requests 2, 3, 4... while
+request 1's model inference is running in the other process. That's what
+"truly async" means — the HTTP layer is no longer frozen waiting for the model.
+
+#### One-line summary
+
+`async def` alone doesn't fix the GIL. You need the model in a separate
+process. BentoML Runner does exactly that with one line: `.to_runner()`.
+
+> **Note:** `.to_runner()` is the legacy (pre-1.2) spelling — see the version
+> note below. In the current `@bentoml.service` API this repo uses, the same
+> separation comes from `workers` (each worker is its own process with its own
+> GIL) plus the dispatcher's request queue.
 
 ### What it is
 
