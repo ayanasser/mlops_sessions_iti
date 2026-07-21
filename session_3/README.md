@@ -23,7 +23,7 @@ session_3/
 ├── Dockerfile                   # extends apache/airflow:3.3.0 with the DAG runtime deps
 ├── requirements.txt             # deps baked into the Airflow image
 ├── .env                         # Airflow local-dev env (UID, Fernet key, admin login)
-├── pyproject.toml               # project deps + optional extras (tracking/gcp/bentoml/load)
+├── pyproject.toml               # project deps + optional extras (tracking/streaming/gcp/bentoml/load)
 ├── Dags/
 │   └── example_1.py             # retraining DAG: extract → train → evaluate
 ├── src/
@@ -31,7 +31,7 @@ session_3/
 │   ├── prepare.py               # seeds data/processed/train.parquet (synthetic)
 │   ├── train.py                 # fits the RandomForest → models/rf_model.pkl
 │   └── batch_scoring.py         # ── batch strategy: GCS parquet in → predictions out
-├── main_streaming_inference.py  # ── streaming strategy: Pub/Sub-triggered Cloud Function
+├── consumer.py                  # ── streaming strategy: Kafka event-driven inference consumer
 ├── bentoml_example.py           # BentoML service (save → serve → build → containerize)
 ├── locustfile.py                # load-test scenario (90% /predict, 10% /health)
 ├── config/
@@ -47,6 +47,7 @@ pip install -e .
 
 # Add only the extras you need for the section you're on:
 pip install -e ".[tracking]"   # MLflow registry (batch, streaming, BentoML all load from it)
+pip install -e ".[streaming]"  # confluent-kafka for consumer.py (pulls in tracking too)
 pip install -e ".[gcp]"        # google-cloud-storage + firestore
 pip install -e ".[bentoml]"    # BentoML serving
 pip install -e ".[load]"       # Locust
@@ -209,10 +210,17 @@ An event lands on a message topic; a function wakes up, scores it, and writes th
 prediction to a store. No polling, no server you manage, no fixed schedule —
 the *event* is the trigger.
 
-[`main_streaming_inference.py`](main_streaming_inference.py) is a **GCP Cloud
-Function** triggered by every message published to the `ride-events` Pub/Sub
-topic. It decodes the base64 payload, scores it, and appends the result to a
-Firestore collection.
+Two variants of the same idea live in this session:
+
+- **Serverless** — a GCP Cloud Function triggered by the `ride-events` Pub/Sub
+  topic (code inline below). GCP runs the consumer *for* you: scaling,
+  retries, and the subscription loop are all managed.
+- **Self-hosted** — [`consumer.py`](consumer.py), a long-running process that
+  subscribes to a **Kafka** topic. Same handler shape, but *you* own the loop —
+  which is exactly what makes it runnable (and testable) entirely on your laptop.
+
+The Cloud Function decodes the base64 payload, scores it, and appends the
+result to a Firestore collection:
 
 ```python
 MODEL = None   # module-level: loaded ONCE per container, not per message
@@ -242,20 +250,57 @@ only a cold start pays the cost.
 - **Producer and consumer are decoupled.** The app publishes a ride event and moves on. If the model is down, messages queue in Pub/Sub instead of erroring out.
 - **Pub/Sub retries on failure** — a raised exception means the message is redelivered, not lost.
 
-#### Testing the handler locally
+#### Run it locally — `consumer.py` + Kafka
 
-The handler is a plain function — you don't need a deployed topic to exercise it,
-just a base64-encoded payload shaped like a Pub/Sub event:
+[`consumer.py`](consumer.py) is the self-hosted twin: the same lazy
+`get_model()` + `predict_on_event()` handler, wrapped in a
+`confluent-kafka` poll loop that subscribes to the `ride-events` topic and
+appends every prediction to `predictions.jsonl` (the swap-point for
+PostgreSQL/Redis in real life). A malformed message is logged and skipped —
+one bad event must never kill the consumer.
+
+Two contracts to respect, both learned the hard way:
+
+- The registered model expects **exactly 2 features** —
+  `["distance_km", "passengers"]` (see `FEATURES` in
+  [`src/train.py`](src/train.py)). No `hour_of_day`.
+- The registry stores `mlflow-artifacts:/` URIs, so the model **must** be
+  loaded through the running MLflow server (`http://localhost:5000`) —
+  pointing `MLFLOW_TRACKING_URI` straight at `sqlite:///mlflow.db` fails.
 
 ```bash
-export MODEL_URI=models:/RideDurationModel/Production
-python -c '
-import base64, json, main_streaming_inference as m
-msg = {"ride_id":"r-123","distance_km":8.4,"passengers":2,"hour_of_day":17}
-event = {"data": base64.b64encode(json.dumps(msg).encode())}
-m.predict_on_pubsub(event, None)
-'
+# ── One-time setup ────────────────────────────────────
+pip install -e ".[streaming]"                     # confluent-kafka + mlflow
+
+# ── Start the broker (single-node KRaft, no ZooKeeper) ─
+docker run -d --name kafka -p 9092:9092 apache/kafka
+docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --topic ride-events
+
+# ── Run the consumer (blocks, handling messages forever) ─
+export MLFLOW_TRACKING_URI="http://localhost:5000"          # the mlflow server
+export MODEL_URI="models:/RideDurationModel@production"     # alias, not stage
+python consumer.py
+
+# ── Publish a test event from another shell ───────────
+docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic ride-events <<< \
+  '{"ride_id": "r1", "distance_km": 3.2, "passengers": 1}'
+
+# consumer prints:   processed: {'ride_id': 'r1', 'prediction': 8.21}
+# and appends it to: predictions.jsonl
 ```
+
+Gotchas seen in practice:
+
+- **Port 9092 already taken?** (e.g. the session_4 Langfuse MinIO container
+  maps it) — run the broker on another host port and point the consumer at it
+  with `KAFKA_BOOTSTRAP=localhost:<port>`.
+- **Restarted the consumer and messages seem stuck?** The old instance's group
+  membership blocks partition assignment until the broker's ~45 s session
+  timeout expires. Wait it out — the backlog then replays in order
+  (`auto.offset.reset=earliest` + committed offsets = at-least-once delivery,
+  for free).
 
 ### 2.3 Release strategies — roll out without breaking users
 
@@ -629,12 +674,100 @@ docker run -p 3000:3000 ride_duration_api:latest # the same image you'd ship any
 
 ---
 
+## 5. Accelerated serving — Triton (GPU) & OpenVINO (CPU)
+
+BentoML solved the *packaging* problem, but the request path is still Python.
+The [`serving_levels/`](serving_levels/) folder climbs one rung further: hand
+the model to a dedicated **inference runtime** that executes an optimized graph
+instead of eager PyTorch. Two names dominate that rung — one per kind of
+hardware.
+
+### 5.1 NVIDIA Triton Inference Server — the GPU-accelerated path
+
+#### What it is
+
+**Triton** is NVIDIA's open-source, C++ **inference server**. Its job is to be
+the production serving layer itself: you don't write an API around your model —
+you drop the model file into a `model_repository/` directory, describe it in a
+`config.pbtxt` text file, and Triton provides the HTTP/gRPC endpoints, dynamic
+batching, versioning, and Prometheus metrics. Everything
+[`level_2_batching.py`](serving_levels/level_2_batching.py) built by hand
+(~90 lines of `asyncio.Queue` + futures) becomes a `dynamic_batching { ... }`
+stanza in that config file.
+
+#### Why it matters
+
+- **No GIL anywhere on the request path** — the server is C++, so section 4's
+  entire GIL discussion evaporates.
+- **Multiple frameworks in one process**: a TensorRT vision model, an ONNX
+  ranker and a PyTorch encoder behind one endpoint, one GPU, one deployment.
+- **Concurrent model execution**: `instance_group { count: 2 }` runs genuine
+  parallel copies per device (Level 3, Lever C — impossible in the Python levels
+  without a rewrite).
+- **Model ensembles**: chain preprocess → infer → postprocess as a server-side
+  DAG, the proper fix for the preprocessing bottleneck Level 3 uncovers.
+- **Hot reload**: drop a `2/` version directory in and it loads live.
+
+#### When to use it
+
+A GPU fleet serving several models under a latency SLA. The cost is a model
+*conversion* step (PyTorch → ONNX/TensorRT), another config format to get
+right, and a ~15 GB runtime image. For one sklearn model in a Python shop,
+BentoML is the better trade — Triton is what you graduate to when the GPU bill
+and the latency SLA justify it.
+
+### 5.2 OpenVINO — the CPU-accelerated path
+
+#### What it is
+
+**OpenVINO** is Intel's open-source **inference toolkit**. Its job is Level 3's
+"Lever A" (graph optimization) for machines *without* a GPU: it compiles a
+trained model (ONNX, PyTorch, TensorFlow) into an optimized graph — fusing
+Conv+BN+ReLU into single kernels, folding constants, planning memory ahead of
+time — and executes it with kernels tuned for Intel CPUs, integrated GPUs and
+NPUs. Pair it with INT8 quantization (Lever B) and a CPU commonly gains 2–4×
+throughput with little to no accuracy loss.
+
+#### Why it matters
+
+Most real deployments never see a GPU — the economics of batch scoring and
+low-QPS APIs are CPU economics. Runtime optimization is **the only lever that
+still pays off on CPU**: batching (Level 2) barely helps there because a CPU is
+already compute-saturated by one input, as
+[`level_3_optimize.py`](serving_levels/level_3_optimize.py) demonstrates with
+real numbers.
+
+#### When to use it
+
+CPU-only or edge deployments, especially on Intel hardware. It sits in the same
+family as ONNX Runtime (portable, multi-vendor) and TensorRT (NVIDIA GPUs,
+maximum speed) — same lever, different hardware target. Measure on *your*
+target machine before committing: Level 3's core lesson is that a lever that
+helps on one device can hurt on another.
+
+### Where they live in this repo
+
+| File | What it shows |
+|---|---|
+| [`serving_levels/level_3_optimize.py`](serving_levels/level_3_optimize.py) | The CPU lever, measured: eager PyTorch vs `torch.compile` vs ONNX Runtime FP32/INT8 on your machine. OpenVINO is a drop-in alternative runtime for the same lever (same ONNX export, different engine). |
+| [`serving_levels/level_4_triton_export.py`](serving_levels/level_4_triton_export.py) | Exports ResNet-50 to ONNX with a dynamic batch axis and **verifies** the output against PyTorch — the step people skip. |
+| [`serving_levels/level_4_triton/`](serving_levels/level_4_triton/) | A real, ready-to-mount Triton `model_repository/` with a fully commented [`config.pbtxt`](serving_levels/level_4_triton/model_repository/resnet50/config.pbtxt). Its `platform:` line accepts `openvino` too — inside Triton, OpenVINO is just another backend. |
+| [`serving_levels/level_4_triton/README.md`](serving_levels/level_4_triton/README.md) | The `docker run` command, health/metrics checks, a line-by-line comparison with the hand-written Level 2 batcher — and the honest caveat that Triton's image is `linux/amd64` only, so an Apple Silicon Mac can read the config but not benchmark it. |
+| [`serving_levels/level_5_vllm_llm.py`](serving_levels/level_5_vllm_llm.py) | The rung above both: LLMs break the fixed-shape batching model entirely, so vLLM uses continuous batching + PagedAttention (CUDA GPU required). |
+
+The full ladder — with the eager-mode explanation, the chef analogy, and the
+benchmark methodology — is in
+[`serving_levels/README.md`](serving_levels/README.md).
+
+---
+
 ## Where this leaves you
 
 You now have all three deployment shapes for the same model, and the tools to
 choose between them: **Airflow** schedules the retraining, **batch scoring**
 serves the cheap/high-throughput case, **streaming inference** serves the
-event-driven case, **BentoML** serves the online case, and **Locust** tells you
-which of them will hold up.
+event-driven case, **BentoML** serves the online case, **Locust** tells you
+which of them will hold up — and when Python serving itself becomes the
+bottleneck, **Triton** (GPU) and **OpenVINO** (CPU) are the next rung.
 
 The lesson worth keeping: the model was the easy part.

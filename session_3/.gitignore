@@ -18,6 +18,9 @@ gcp-key.json
 /logs/
 /plugins/
 
+# Runtime output of consumer.py (one JSON line per scored event)
+predictions.jsonl
+
 # Pipeline artifacts (data + models are tracked by DVC, not git)
 /data/raw/*
 !/data/raw/.gitkeep
@@ -26,6 +29,7 @@ gcp-key.json
 /models/
 /metrics/
 /mlruns/
+/mlartifacts/
 mlflow.db
 
 # Terraform (see infra/)

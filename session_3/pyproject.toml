@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # MLflow model registry. Every "load the Production model" call site needs this:
-#   src/batch_scoring.py, main_streaming_inference.py, bentoml_example.py.
+#   src/batch_scoring.py, consumer.py, bentoml_example.py.
 # Install with: pip install -e ".[tracking]"
 tracking = [
     "mlflow>=2.12",
@@ -26,7 +26,13 @@ tracking = [
 # Google Cloud SDKs. Install with: pip install -e ".[gcp]"
 gcp = [
     "google-cloud-storage>=2.16",    # src/batch_scoring.py, Dags extract task
-    "google-cloud-firestore>=2.16",  # main_streaming_inference.py prediction sink
+    "google-cloud-firestore>=2.16",  # prediction sink of the (serverless) Cloud Function variant
+]
+# Event-driven inference consumer (consumer.py), reading a Kafka topic.
+# Install with: pip install -e ".[streaming]"
+streaming = [
+    "confluent-kafka>=2.5",
+    "ride-duration-serving[tracking]",  # loads the model out of the registry
 ]
 # BentoML serving (bentoml_example.py), written for the 1.2+ class-based
 # `@bentoml.service` API. Install with: pip install -e ".[bentoml]"

@@ -48,6 +48,6 @@ def batch_score(bucket_name: str, input_blob: str, output_blob: str) -> None:
 if __name__ == "__main__":
     batch_score(
         bucket_name="mlops-session2-iti",
-        input_blob=f"scoring/input/{date.today()}.parquet",
+        input_blob="scoring/input/2026-07-14.parquet",
         output_blob=f"scoring/output/{date.today()}.parquet",
     )
