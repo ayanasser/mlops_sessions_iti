@@ -4,10 +4,112 @@ A minimal [FastAPI](https://fastapi.tiangolo.com/) service that predicts ride
 duration (in minutes) from a trip's distance and passenger count. Built as an
 MLOps course example.
 
+## 🚫 What NOT to do: the "everything notebook"
+
+[`bad_notebook_example.ipynb`](bad_notebook_example.ipynb) is a **deliberately
+bad** notebook that crams exploration, preprocessing, training, evaluation and
+"tests" into one file — the classic starting point of most ML projects, and the
+reason most of them never reach production. Every problem below is present in
+the notebook (marked with ❌ comments). The rest of this project is the
+*fixed* version of the same workflow.
+
+### Everything wrong with the notebook
+
+**Structure & reproducibility**
+
+1. **Everything in one notebook** — EDA, preprocessing, training, evaluation and
+   tests in a single file. Nothing can be imported, reused, scheduled or
+   deployed independently.
+2. **`!pip install` with no versions** (and the deprecated `sklearn` package
+   name) — the environment is different every time someone runs it; there is no
+   `pyproject.toml`/lockfile to reproduce it.
+3. **No random seeds anywhere** — data generation, the train/test split and the
+   RandomForest all give different results on every run.
+4. **Hidden notebook state & out-of-order execution** — one cell only works if
+   you run the cell *below* it first; "Restart & Run All" crashes with a
+   `NameError`.
+5. **Non-idempotent cells** — the preprocessing cell mutates `df` in place, so
+   running it twice converts miles→km *twice* and silently corrupts the data.
+
+**Hardcoding & configuration**
+
+6. **Hardcoded absolute paths** (`/Users/aya/Desktop/...`) for both data and the
+   saved model — breaks on any other machine and in CI.
+7. **Magic numbers everywhere** (`< 120`, `> 0.3`, `test_size=0.33`,
+   `alpha=0.1`) with no config file and no explanation.
+8. **Secrets hardcoded in the notebook** (API token, DB password) — one
+   `git push` away from a credential leak.
+
+**ML correctness**
+
+9. **Data leakage #1** — a feature (`duration_per_km`) is computed *from the
+   target*, so the model just reads the answer.
+10. **Data leakage #2** — the `StandardScaler` is fit on the full dataset
+    *before* the train/test split.
+11. **Model selection on the test set** — the "best" model is picked by peeking
+    at test scores, so the test set no longer measures generalization.
+12. **Evaluation on training data reported as "model accuracy"** — the headline
+    metric is meaningless.
+13. **Training/serving skew** — inference-time preprocessing is copy-pasted and
+    subtly different (the unit conversion is missing, the leakage feature is
+    replaced by a guess).
+
+**Engineering hygiene**
+
+14. **Bare `except:` blocks that swallow errors** — a missing data file silently
+    falls back to *random fabricated data* and training continues.
+15. **`warnings.filterwarnings('ignore')`** — the warnings that would have
+    caught several bugs above are muted.
+16. **Wildcard imports** (`from sklearn.linear_model import *`) and **shadowed
+    builtins** (`list`, `sum` reassigned).
+17. **No functions, no classes, no docstrings, no type hints** — everything is
+    global state, so nothing is unit-testable.
+18. **`print()` debugging instead of logging**; metrics "tracked" in code
+    comments (`# rf tuesday: 0.97`) instead of an experiment tracker.
+19. **Dead code kept as version control** — commented-out model attempts, and
+    hyperparameter history lost by hand-editing the same cell.
+20. **Silent data drops** — `dropna()` and hard filters with no record of how
+    many rows were removed and no data validation.
+
+**Testing**
+
+21. **Useless tests**: `assert True`; an accuracy threshold checked *on training
+    data* (an overfit model passes proudly); a flaky assertion against a
+    hardcoded value from one unseeded run (commented out "because it kept
+    failing"); and a `try/except: pass` that prints *"all tests passed ✅"* no
+    matter what. None of them run in CI.
+
+**Deployment**
+
+22. **Model "versioning" by filename** (`model_final_v2_REAL_final.pkl`) pickled
+    to a Desktop — no registry, no metadata, and the scaler needed to reproduce
+    the features is never saved at all.
+23. **No entry point** — no CLI, no API, nothing a scheduler or a server can
+    call. A human must open Jupyter and run cells in the right order.
+
+### From notebook to production — how this repo fixes it
+
+| Notebook problem | Production fix in this repo |
+|---|---|
+| Everything in one `.ipynb` | Logic extracted into importable modules: [`src/model.py`](src/model.py) |
+| `!pip install` with no versions | Declared, versioned dependencies in [`pyproject.toml`](pyproject.toml) (`pip install -e .`) |
+| Manual cell-based "tests" | Real `pytest` unit tests in [`tests/test_model.py`](tests/test_model.py), runnable in CI |
+| No entry point | A served API: [`fastapi_example.py`](fastapi_example.py) / [`litestar_example.py`](litestar_example.py) with `/predict` + `/health` |
+| Hardcoded paths & "works on my machine" | Containerized with the [`Dockerfile`](Dockerfile); model path injected via the `MODEL_PATH` env var in [`docker-compose.yml`](docker-compose.yml) |
+| Metrics in print statements & comments | MLflow tracking server in the compose stack |
+| Pickle on a Desktop | Models mounted from a versioned [`models/`](models/) directory (e.g. `models/v1/`) |
+
+The general recipe: **extract** pure functions (load → preprocess → train →
+evaluate) out of the notebook into modules, **parameterize** every path and
+magic number (config/env vars/CLI args), **pin** the environment, **test** the
+functions with pytest, **track** experiments instead of printing them, and keep
+notebooks only for what they're good at — exploration and reporting.
+
 ## Project structure
 
 ```
 session_1/
+├── bad_notebook_example.ipynb  # ⚠️ intentional ANTI-example (see section above)
 ├── fastapi_example.py    # FastAPI app + entry point
 ├── litestar_example.py   # Litestar app (same model, DI-based)
 ├── msgpack_example.py    # MessagePack (de)serialization example
