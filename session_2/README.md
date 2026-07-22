@@ -26,7 +26,7 @@ since that's what CI builds and pushes.)
 
 ```
 session_2/
-├── mlflow_example.py                 # MLflow training + logging script (entry point)
+├── mlflow_example.py                 # trains 13 models (linear/RF/XGBoost/MLP), compares runs, registers the winner
 ├── mlflow_modelregiestry_example.py  # load/promote a registered model via MlflowClient (aliases)
 ├── mlflow_s3_registry_example.py     # same, against an S3-backed tracking server
 ├── mlflow_gcs_registry_example.py    # same, against a GCS-backed tracking server
@@ -270,29 +270,47 @@ unchanged from the local example, which is the whole point.
 python mlflow_example.py
 ```
 
-This will:
+> **macOS:** XGBoost needs the OpenMP runtime — `brew install libomp` once.
+
+This trains **13 candidate models across 4 families** — linear (OLS/Ridge),
+Random Forest, XGBoost, and MLP — each with different hyperparameters, and
+logs every one as its own MLflow run in the same experiment:
 
 1. Generate synthetic ride data and split it into train/validation sets
-   (`src/train.py`).
-2. Log the hyperparameters (`n_estimators`, `max_depth`, …) and free-form tags.
-3. Train a `RandomForestRegressor`.
-4. Log the metrics (`rmse`, `mae`, `r2`, `val_size`).
-5. Log a **learning curve** as stepped metrics (RMSE/MAE/R² vs. tree count) —
-   an interactive line chart in the UI.
-6. Log **diagnostic figures** as PNG artifacts (predicted-vs-actual, residuals,
-   feature importances).
-7. Log **and register** the fitted model as `RideDurationModel`, then annotate
-   the new version with a description, tags, and the moving alias `@champion`.
-
-It prints the run ID, MAE, and the registered version, e.g.:
+   (`src/train.py`) — every candidate sees the **same split**, so the
+   comparison is fair.
+2. Per run: log the hyperparameters and a `model_family` tag, train, and log
+   the **shared metric set** (`rmse`, `mae`, `r2`, `train_seconds`). Identical
+   metric names across runs are what make cross-run sorting meaningful.
+3. Per run: log **family-specific diagnostics** — coefficients (linear),
+   feature importances (RF/XGBoost), a per-epoch `train_loss` curve as
+   stepped metrics (MLP) — plus a predicted-vs-actual plot for every run.
+4. Print a **leaderboard** sorted by validation MAE, then register **only the
+   winner** as `RideDurationModel` and annotate the new version with a
+   description, tags, and the moving alias `@champion`.
 
 ```
-Run ID: a1b2c3...  |  MAE: 0.83  |  R2: 0.99
+=== Leaderboard (val MAE, lower is better) ===
+   1. linear-ols           [linear       ] MAE=0.790  RMSE=0.986  R2=0.995
+   2. linear-ridge-a1      [linear       ] MAE=0.790  RMSE=0.986  R2=0.995
+   ...
+  13. rf-small             [random_forest] MAE=1.526  RMSE=1.916  R2=0.981
+
+Winner: linear-ols (linear)  |  MAE: 0.790
 Registered 'RideDurationModel' version 1 (alias: @champion)
 ```
 
-Open **http://localhost:5000** to browse the experiment
-(`ride-duration-model`), compare runs, and inspect the registered model.
+(Spoiler: the linear models usually win — the synthetic data *is* linear, so
+the extra capacity of XGBoost/MLP buys nothing. That "fancier isn't better
+here" conclusion is exactly what a run-comparison table makes obvious.)
+
+Open **http://localhost:5000** → experiment `ride-duration-model`, then:
+
+- **Sort** the run table by the `mae` column → instant leaderboard.
+- **Tick several runs → Compare** → parallel-coordinates & scatter charts of
+  hyperparameters vs. metrics.
+- **Filter** with the search bar: `tags.model_family = 'xgboost'`.
+- Open any `mlp-*` run → *Model metrics* → the `train_loss` convergence curve.
 
 > The script reads the tracking URI from the `MLFLOW_TRACKING_URI` env var,
 > defaulting to `http://localhost:5000`. Point it at a remote server by
@@ -338,9 +356,10 @@ model = mlflow.sklearn.load_model("models:/RideDurationModel/3")
 
 ## 2. Weights & Biases (alternative tracker)
 
-[`wandb_example.py`](wandb_example.py) mirrors `mlflow_example.py` **feature for
-feature** against [W&B](https://wandb.ai/), so you can see how the two trackers
-map onto each other:
+[`wandb_example.py`](wandb_example.py) mirrors the single-model (RandomForest)
+version of `mlflow_example.py` **feature for feature** against
+[W&B](https://wandb.ai/), so you can see how the two trackers map onto each
+other:
 
 | MLflow                              | Weights & Biases                                |
 |-------------------------------------|-------------------------------------------------|

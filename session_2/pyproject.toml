@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "mlflow>=2.12",
     "scikit-learn>=1.4",
+    "xgboost>=2.0",     # multi-model comparison in mlflow_example.py (macOS: brew install libomp)
     "numpy>=1.26",
     # Used by the DVC pipeline stages (prepare / train / evaluate):
     "pandas>=2.0",
